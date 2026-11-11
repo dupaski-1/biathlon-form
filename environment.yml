@@ -11,4 +11,4 @@ dependencies:
   - jupyter=1.1.1
   - pip
   - pip:
-      - biathlonresults==0.1
+      - biathlonresults==0.1.1
