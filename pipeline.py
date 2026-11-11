@@ -1,8 +1,10 @@
 # pipeline.py
-# The data pipeline of the project. For now it has 1 step:
+# The data pipeline of the project. The steps so far:
 #
-#   python pipeline.py features
+#   python pipeline.py features    build data/features.csv
+#   python pipeline.py split       print the season split and the validation folds
 #
+# About "features":
 # It reads data/sprints_raw.csv and data/races_all.csv, cleans them, builds
 # the target and the 13 features, and writes data/features.csv with
 # 1 row per finisher per sprint.
@@ -31,6 +33,23 @@ MAX_DAYS_SINCE = 365
 # is simply "experienced", so we stop counting at 20. A second reason: the
 # data starts in 2012, so high counts are not complete anyway.
 MAX_PREV_SPRINTS = 20
+
+# The season split. A season is written like "1314" for the winter 2013/14.
+# History only: the first season of the data. Its rows have almost no past
+# (nothing exists before 2012), so we never train on them and never score them.
+# They were only useful to build the features of the later seasons.
+HISTORY_SEASONS = ["1213"]
+# Training: the seasons the models may learn from.
+TRAIN_SEASONS = ["1314", "1415", "1516", "1617", "1718",
+                 "1819", "1920", "2021", "2122", "2223"]
+# Test: the 3 last seasons. They stay closed until step 6 (the final score),
+# so that no choice we make can be influenced by them.
+TEST_SEASONS = ["2324", "2425", "2526"]
+# Validation: each of these seasons is predicted once by a model trained on
+# all training seasons before it. Every model uses these same 5 folds.
+VALIDATION_SEASONS = ["1819", "1920", "2021", "2122", "2223"]
+
+TOP_N = 10      # the hit rate metric looks at the top 10 of each race
 
 # The 13 features, in the order of the project brief.
 FEATURES = [
@@ -270,6 +289,116 @@ def print_checks(out, fin, races):
     print(log[["day", "event_id", "place", "discipline", "leg", "Rank", "IRM"]].to_string(index=False))
 
 
+# ------------------------------------------------------------------ split
+
+def load_features():
+    """Load data/features.csv WITHOUT the test seasons.
+    Every later step gets its data from here, so no step can see the test rows."""
+    df = pd.read_csv(FEATURES_FILE, dtype={"season": str})
+    return df[~df["season"].isin(TEST_SEASONS)].reset_index(drop=True)
+
+
+def count_test():
+    """Count the rows and races of the test seasons, and nothing more.
+    usecols reads only these 2 columns: no feature and no result is loaded."""
+    df = pd.read_csv(FEATURES_FILE, dtype={"season": str}, usecols=["season", "race_id"])
+    return df[df["season"].isin(TEST_SEASONS)]
+
+
+def make_folds(df):
+    """Build the walk forward folds. Returns a list with, for each fold:
+    the validation season, the training part and the validation part."""
+    folds = []
+    for val_season in VALIDATION_SEASONS:
+        # The training seasons that come before the validation season.
+        # Seasons written as text sort in time order ("1314" < "1415" < ...).
+        seasons_before = [s for s in TRAIN_SEASONS if s < val_season]
+        train_part = df[df["season"].isin(seasons_before)]
+        val_part = df[df["season"] == val_season]
+        folds.append((val_season, train_part, val_part))
+    return folds
+
+
+# ------------------------------------------------------------------ metrics
+# Each metric gets the rows of some races (with race_id and the true finish
+# percentile) and 1 prediction per row, in the same order.
+
+def mae(rows, pred):
+    """Mean absolute error: the mean distance between prediction and truth.
+    This is the primary metric, used for all choices."""
+    return np.mean(np.abs(np.asarray(pred) - rows[TARGET].to_numpy()))
+
+
+def mean_spearman(rows, pred):
+    """Rank correlation between prediction and truth in each race, then the
+    mean over the races. 1 = same order, 0 = no link."""
+    table = pd.DataFrame({"race_id": rows["race_id"].to_numpy(),
+                          "true": rows[TARGET].to_numpy(),
+                          "pred": np.asarray(pred)})
+    values = []
+    for race_id, race in table.groupby("race_id"):
+        # If a model predicts the same value for everybody in a race, there
+        # is no order to compare: the correlation does not exist, skip the race.
+        if race["pred"].nunique() < 2:
+            continue
+        # Spearman = the usual correlation, computed on the ranks.
+        values.append(race["pred"].rank().corr(race["true"].rank()))
+    if len(values) == 0:
+        return np.nan                # no race could be scored
+    return np.mean(values)
+
+
+def top_n_hit_rate(rows, pred):
+    """In each race: take the TOP_N athletes with the lowest predicted
+    percentile and count the share that really finished in the top TOP_N.
+    Then the mean over the races."""
+    table = pd.DataFrame({"race_id": rows["race_id"].to_numpy(),
+                          "true": rows[TARGET].to_numpy(),
+                          "pred": np.asarray(pred)})
+    values = []
+    for race_id, race in table.groupby("race_id"):
+        # Mix the rows of the race in a random order (always the same one,
+        # because of random_state). The file is sorted by real rank, so
+        # without this, equal predictions would be picked in the real order
+        # and a model that predicts the same value for all would look perfect.
+        race = race.sample(frac=1, random_state=0)
+        # The real place in the race, found again from the true percentile.
+        place = race["true"].rank(method="min")
+        picked = race["pred"].nsmallest(TOP_N).index      # our predicted top 10
+        values.append((place[picked] <= TOP_N).mean())    # share of real top 10
+    return np.mean(values)
+
+
+def all_metrics(rows, pred):
+    """The 3 metrics together, as a small dictionary."""
+    return {"mae": mae(rows, pred),
+            "spearman": mean_spearman(rows, pred),
+            "top10": top_n_hit_rate(rows, pred)}
+
+
+def show_size(label, df):
+    """Print the number of rows and races of a table."""
+    print(f"{label:<28} rows: {len(df):>6}   races: {df['race_id'].nunique():>4}")
+
+
+def show_split():
+    """Step 3: print the season split and the validation folds."""
+    df = load_features()            # the test seasons are already removed here
+
+    print("--- season split ---")
+    show_size("history " + HISTORY_SEASONS[0], df[df["season"].isin(HISTORY_SEASONS)])
+    show_size("training " + TRAIN_SEASONS[0] + "-" + TRAIN_SEASONS[-1],
+              df[df["season"].isin(TRAIN_SEASONS)])
+    show_size("test " + TEST_SEASONS[0] + "-" + TEST_SEASONS[-1] + " (counts only)",
+              count_test())
+
+    print("\n--- validation folds (walk forward by season) ---")
+    for val_season, train_part, val_part in make_folds(df):
+        seasons = train_part["season"].unique()
+        show_size("train " + seasons.min() + "-" + seasons.max(), train_part)
+        show_size("  validate " + val_season, val_part)
+
+
 # ------------------------------------------------------------------ main step
 
 def make_features():
@@ -295,5 +424,7 @@ if __name__ == "__main__":
     # The word after "python pipeline.py" says which step to run.
     if len(sys.argv) == 2 and sys.argv[1] == "features":
         make_features()
+    elif len(sys.argv) == 2 and sys.argv[1] == "split":
+        show_split()
     else:
-        print("usage: python pipeline.py features")
+        print("usage: python pipeline.py features   or   python pipeline.py split")
