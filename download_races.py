@@ -24,6 +24,7 @@ MAX_TRIES = 4          # how many times we try a call before giving up
 PARTS_DIR = "data/races_parts"       # 1 small file per race = our saved progress
 OUT_FILE = "data/races_all.csv"      # the final file
 SPRINT_FILE = "data/sprints_raw.csv" # the old sprint file, only read, never written
+CANCELLED_FILE = "data/races_cancelled.csv"   # the list of the cancelled races
 
 # The API gives short codes for the formats. This table is only for printing.
 FORMAT_NAMES = {"SP": "sprint", "PU": "pursuit", "IN": "individual",
@@ -118,6 +119,10 @@ races = list_races()
 cancelled = races[races["status"] != "Final"]
 races = races[races["status"] == "Final"].reset_index(drop=True)
 print(len(races), "races to get,", len(cancelled), "cancelled")
+
+# Save the list of the cancelled races, so that it is not only on the screen.
+cancelled[["race_id", "event_id", "season", "place", "start",
+           "discipline", "category", "status"]].to_csv(CANCELLED_FILE, index=False)
 
 for i, race in races.iterrows():
     part_file = os.path.join(PARTS_DIR, race["race_id"] + ".csv")

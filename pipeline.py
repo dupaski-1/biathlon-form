@@ -12,11 +12,12 @@
 # Golden rule: a feature of a race only uses races that started BEFORE it.
 
 import sys
+import zlib
 
 import numpy as np
 import pandas as pd
 
-SPRINT_FILE = "data/sprints_raw.csv"    # sprints with split times (from 01_explore)
+SPRINT_FILE = "data/sprints_raw.csv"    # sprints with split times (from download_sprints.py)
 RACES_FILE = "data/races_all.csv"       # all formats, results only (from download_races.py)
 FEATURES_FILE = "data/features.csv"     # what this step creates
 
@@ -50,6 +51,23 @@ TEST_SEASONS = ["2324", "2425", "2526"]
 VALIDATION_SEASONS = ["1819", "1920", "2021", "2122", "2223"]
 
 TOP_N = 10      # the hit rate metric looks at the top 10 of each race
+
+# Range time rule: in a sprint, a range time above 10 minutes cannot be true
+# (2 shootings take about 1 to 2 minutes together). Such a value is a mistake
+# in the raw data, so we treat it as missing. 10 minutes = 600 seconds.
+MAX_RANGE_SECONDS = 600
+
+# The 16 races that were cancelled (seasons 2012/13 to 2022/23). They have no
+# rows in the data files. The list was printed by download_races.py at the
+# end of the download and is copied here once.
+CANCELLED_RACES = [
+    "BT1314SWRLCP01SWPU", "BT1314SWRLCP01SMPU", "BT1314SWRLCP06SWRL",
+    "BT1516SWRLCP09SMMS", "BT1516SWRLCP09SWMS", "BT1819SWRLCP07SMSP",
+    "BT1819SWRLCP07SWSP", "BT1920SWRLCP08MXSR", "BT1920SWRLCP08MXRL",
+    "BT1920SWRLCP09SWSP", "BT1920SWRLCP09SMSP", "BT1920SWRLCP09SWPU",
+    "BT1920SWRLCP09SMPU", "BT1920SWRLCP09SWMS", "BT1920SWRLCP09SMMS",
+    "BT2223SWRLCP09SWPU",
+]
 
 # The 13 features, in the order of the project brief.
 FEATURES = [
@@ -133,6 +151,11 @@ def build_target(sprints):
     # Finish percentile = (rank - 1) / (number of finishers - 1).
     n_finishers = fin.groupby("race_id")["Rank"].transform("count")
     fin[TARGET] = (fin["Rank"] - 1) / (n_finishers - 1)
+
+    # Range time rule: a range time above the limit counts as missing.
+    # This is done here, BEFORE the range percentiles are computed, so the
+    # wrong value gets no percentile and does not push the others.
+    fin.loc[fin["RNGT_s"] > MAX_RANGE_SECONDS, "RNGT_s"] = np.nan
 
     # Same idea with the skiing time (CRST) and the time on the range (RNGT).
     fin["ski_pct"] = percentile(fin["CRST_s"], fin["race_id"])
@@ -257,10 +280,19 @@ def add_race_history(fin, races):
 # ------------------------------------------------------------------ checks
 
 def print_checks(out, fin, races):
-    """Print the checks of step 2."""
+    """Print the checks of step 2. The file holds all seasons, but the checks
+    only look at the open seasons: the test seasons stay closed until step 6."""
+    # The only thing shown about all seasons together: the 2 counts.
     print("rows:", len(out), "(expected 24957)   races:", out["race_id"].nunique(), "(expected 252)")
 
-    print("\n--- share of missing values, min, mean, max ---")
+    # From here on the 3 tables hold the open seasons only (2012/13 to 2022/23).
+    # Everything printed below is computed on these smaller tables.
+    out = open_seasons(out)
+    fin = open_seasons(fin)
+    races = open_seasons(races)
+    print("open seasons only: rows:", len(out), "  races:", out["race_id"].nunique())
+
+    print("\n--- share of missing values, min, mean, max (open seasons only) ---")
     table = pd.DataFrame({"missing": out[[TARGET] + FEATURES].isna().mean(),
                           "min": out[[TARGET] + FEATURES].min(),
                           "mean": out[[TARGET] + FEATURES].mean(),
@@ -268,7 +300,9 @@ def print_checks(out, fin, races):
     print(table.round(3).to_string())
 
     # Leak test on 1 athlete: raw results next to the features.
-    name = "BOE Johannes Thingnes"
+    # His last sprints in the open seasons are from 2022/23, a training season.
+    # He also has 1 sprint with a DNS in that period, which must not be used.
+    name = "LAEGREID Sturla Holm"
     one = fin[fin["Name"] == name].sort_values("start")
     one = one.assign(day=one["date"].dt.date)       # the date in a short form for printing
     print("\n--- leak test:", name, "---")
@@ -290,6 +324,24 @@ def print_checks(out, fin, races):
 
 
 # ------------------------------------------------------------------ split
+
+def open_seasons(df):
+    """Remove the test seasons from a table. They stay closed until step 6."""
+    return df[~df["season"].isin(TEST_SEASONS)].copy()
+
+
+def load_fin():
+    """Rebuild the working table of step 2 without the test seasons.
+    1 row per finisher per sprint. It holds the raw result, the target, the
+    13 features and the helper columns. Used by the lab book."""
+    sprints = open_seasons(load_sprints())
+    races = open_seasons(load_races())
+    fin = build_target(sprints)
+    fin = add_sprint_history(fin)
+    fin = add_race_history(fin, races)
+    fin["day"] = fin["date"].dt.date        # the date in a short form for printing
+    return fin
+
 
 def load_features():
     """Load data/features.csv WITHOUT the test seasons.
@@ -357,11 +409,15 @@ def top_n_hit_rate(rows, pred):
                           "pred": np.asarray(pred)})
     values = []
     for race_id, race in table.groupby("race_id"):
-        # Mix the rows of the race in a random order (always the same one,
-        # because of random_state). The file is sorted by real rank, so
-        # without this, equal predictions would be picked in the real order
-        # and a model that predicts the same value for all would look perfect.
-        race = race.sample(frac=1, random_state=0)
+        # Mix the rows of the race in a random order. The file is sorted by
+        # real rank, so without this, equal predictions would be picked in
+        # the real order and a model that predicts the same value for all
+        # would look perfect.
+        # Each race gets its own order. The seed is a number made from the
+        # race ID: crc32 turns a text into a number, and the same text gives
+        # the same number on every run and on every machine.
+        seed = zlib.crc32(race_id.encode())
+        race = race.sample(frac=1, random_state=seed)
         # The real place in the race, found again from the true percentile.
         place = race["true"].rank(method="min")
         picked = race["pred"].nsmallest(TOP_N).index      # our predicted top 10
