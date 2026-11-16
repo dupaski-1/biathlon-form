@@ -1,0 +1,2 @@
+best,best_mean,se,threshold,n_candidates,n_eligible,final_model,edge_rule,choice_before_edge_rule
+ridge NO_LOAD alpha=0.01,0.15739287067750402,0.001842845468628459,0.15923571614613247,34,25,ridge NO_LOAD alpha=1000,used,ridge NO_LOAD alpha=1000

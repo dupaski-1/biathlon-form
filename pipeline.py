@@ -4,6 +4,7 @@
 #   python pipeline.py features    build data/features.csv
 #   python pipeline.py split       print the season split and the validation folds
 #   python pipeline.py baselines   score the 3 baseline models, save the tables in outputs/
+#   python pipeline.py models      ridge and random forest, choose the final model
 #
 # About "features":
 # It reads data/sprints_raw.csv and data/races_all.csv, cleans them, builds
@@ -18,6 +19,7 @@ import zlib
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
@@ -110,6 +112,41 @@ FEATURES = [
     "first_start_major",   # 12 flag: first start at this World Championships / Olympics
     "no_history",          # 13 flag: no previous sprint
 ]
+
+
+# Step 5: 2 model families on 2 input sets. All rules were fixed BEFORE
+# looking at any result.
+# The 4 load features: how much and how recently the athlete raced.
+LOAD_FEATURES = ["days_since_race", "race_days_21d",
+                 "missed_prev_event", "first_start_major"]
+# FULL = all 13 inputs. NO_LOAD = FULL without the 4 load features (9 inputs).
+INPUT_SETS = {
+    "FULL": FEATURES,
+    "NO_LOAD": [name for name in FEATURES if name not in LOAD_FEATURES],
+}
+
+# The random forest: 300 trees, each split looks at a third of the inputs,
+# a leaf may hold 1 single row, and the seed makes every run the same.
+FOREST_TREES = 300
+FOREST_MAX_FEATURES = 1 / 3
+FOREST_MIN_LEAF = 1
+FOREST_SEED = 42
+# The depths we try. NO_LIMIT stands for "max_depth=None": the trees grow
+# until the end. It is written as infinity, so that it sorts as the deepest.
+NO_LIMIT = np.inf
+DEPTH_GRID = [2, 4, 6, 8, 12, 16, NO_LIMIT]
+# Completing the grid: around the best depth, the 2 depths halfway to its
+# neighbours are added. Once, no second round.
+EXTRA_DEPTHS = {2: [1, 3], 4: [3, 5], 6: [5, 7], 8: [7, 10],
+                12: [10, 14], 16: [14, 20], NO_LIMIT: [20, 24]}
+# Edge rule of step 5: if the final choice is ridge with the largest alpha
+# of the grid, these 2 alphas are added for both input sets. Once.
+EDGE_ALPHAS = [10000, 100000]
+
+# The learning curve: the shares of the training rows, and the seed that
+# picks the random subset.
+CURVE_SHARES = [0.2, 0.4, 0.6, 0.8, 1.0]
+CURVE_SEED = 42
 
 
 # ------------------------------------------------------------------ cleaning
@@ -716,6 +753,339 @@ def run_baselines():
     print("\nsaved in " + OUTPUT_DIR + "/:", ", ".join(name + ".csv" for name in tables))
 
 
+# ------------------------------------------------------------------ models
+# Step 5: ridge and random forest on 2 input sets, and the final choice.
+# A "candidate" is 1 model family + 1 input set + 1 value of its setting
+# (alpha for ridge, depth for the forest).
+
+def make_forest(depth):
+    """The random forest pipeline: median fill, then the forest. No scaler:
+    a tree only asks "is the value above or below a limit", so the scale of
+    an input does not matter. n_jobs=-1 only uses all processor cores, the
+    result is the same."""
+    if depth == NO_LIMIT:
+        max_depth = None                 # how scikit-learn writes "no limit"
+    else:
+        max_depth = int(depth)
+    return Pipeline([("fill", SimpleImputer(strategy="median")),
+                     ("forest", RandomForestRegressor(n_estimators=FOREST_TREES,
+                                                      max_features=FOREST_MAX_FEATURES,
+                                                      min_samples_leaf=FOREST_MIN_LEAF,
+                                                      max_depth=max_depth,
+                                                      random_state=FOREST_SEED,
+                                                      n_jobs=-1))])
+
+
+def make_model(family, value):
+    """Build the pipeline of a candidate: ridge with this alpha, or forest with this depth."""
+    if family == "ridge":
+        return make_ridge(value)
+    return make_forest(value)
+
+
+def candidate_name(family, inputs, value):
+    """A short name for printing, like 'ridge NO_LOAD alpha=10' or 'forest FULL depth=8'."""
+    if family == "ridge":
+        return "ridge " + inputs + " alpha=" + format(value, "g")
+    if value == NO_LIMIT:
+        return "forest " + inputs + " depth=None"
+    return "forest " + inputs + " depth=" + str(int(value))
+
+
+def score_candidates(candidates):
+    """Score a list of candidates (family, inputs, value) on the training part
+    and the validation part of each fold. 1 line per candidate, fold and part."""
+    df = load_features()            # the test seasons are already removed here
+    lines = []
+    fold = 0
+    for val_season, train_part, val_part in make_folds(df):
+        fold = fold + 1
+        for family, inputs, value in candidates:
+            columns = INPUT_SETS[inputs]
+            model = make_model(family, value)
+            # fit sees the training part of this fold only.
+            model.fit(train_part[columns], train_part[TARGET])
+            for part, rows in [("train", train_part), ("validation", val_part)]:
+                pred = model.predict(rows[columns])
+                line = {"family": family, "inputs": inputs, "value": value,
+                        "name": candidate_name(family, inputs, value),
+                        "fold": fold, "val_season": val_season,
+                        "part": part, "n_rows": len(rows)}
+                line.update(all_metrics(rows, pred))
+                # The MAE again, for the rows without and with a previous sprint.
+                new = (rows["no_history"] == 1).to_numpy()
+                line["mae_no_history"] = mae(rows[new], pred[new])
+                line["mae_with_history"] = mae(rows[~new], pred[~new])
+                lines.append(line)
+        print("  fold", fold, "of", len(VALIDATION_SEASONS), "done")
+    return pd.DataFrame(lines)
+
+
+def candidate_table(scores):
+    """1 line per candidate: mean and standard deviation over the 5 folds of
+    every score, on train and on validation. The standard deviation is the
+    sample one (ddof = 1, divided by 5 - 1). SE = standard deviation / sqrt(5)."""
+    keys = ["family", "inputs", "value", "name"]
+    numbers = SCORES + ["mae_no_history", "mae_with_history"]
+    parts = []
+    for part, short in [("validation", "val"), ("train", "train")]:
+        rows = scores[scores["part"] == part]
+        table = rows.groupby(keys)[numbers].agg(["mean", "std"])     # std: ddof = 1
+        table.columns = [short + "_" + score + "_" + what for score, what in table.columns]
+        parts.append(table)
+    table = pd.concat(parts, axis=1).reset_index()
+    n_folds = scores["fold"].nunique()
+    table["val_mae_se"] = table["val_mae_std"] / np.sqrt(n_folds)
+    return table.sort_values("val_mae_mean").reset_index(drop=True)
+
+
+def simplest_first(table):
+    """Sort candidates from the simplest to the most complex:
+    a) NO_LOAD before FULL, b) ridge before forest,
+    c) ridge: the larger alpha first; forest: the smaller depth first."""
+    table = table.copy()
+    table["key_inputs"] = (table["inputs"] != "NO_LOAD").astype(int)     # NO_LOAD = 0, FULL = 1
+    table["key_family"] = (table["family"] != "ridge").astype(int)       # ridge = 0, forest = 1
+    # For ridge a LARGER alpha is simpler, so we turn the sign around.
+    table["key_value"] = np.where(table["family"] == "ridge", -table["value"], table["value"])
+    table = table.sort_values(["key_inputs", "key_family", "key_value"])
+    return table.drop(columns=["key_inputs", "key_family", "key_value"])
+
+
+def one_se_rule(table):
+    """The one standard error rule on a table of candidates.
+    Returns a small dictionary with the best candidate, the threshold, the
+    names of the eligible candidates and the chosen (simplest eligible) one."""
+    best = table.loc[table["val_mae_mean"].idxmin()]          # lowest mean validation MAE
+    threshold = best["val_mae_mean"] + best["val_mae_se"]     # best mean + its SE
+    eligible = table[table["val_mae_mean"] <= threshold]
+    chosen = simplest_first(eligible).iloc[0]
+    return {"best": best["name"], "best_mean": best["val_mae_mean"],
+            "se": best["val_mae_se"], "threshold": threshold,
+            "eligible": eligible["name"].tolist(), "chosen": chosen["name"]}
+
+
+def fold_values(scores, name, column="mae"):
+    """The 5 validation values of 1 candidate, 1 per fold, in fold order."""
+    rows = scores[(scores["name"] == name) & (scores["part"] == "validation")]
+    return rows.sort_values("fold")[column].to_numpy()
+
+
+def compare(scores, table, name_a, name_b, what):
+    """Put 2 candidates next to each other: the 2 mean validation MAEs, the
+    difference (a minus b) in each fold, its mean and its standard error."""
+    diff = fold_values(scores, name_a) - fold_values(scores, name_b)
+    line = {"comparison": what, "a": name_a, "b": name_b,
+            "a_mean": table.set_index("name").loc[name_a, "val_mae_mean"],
+            "b_mean": table.set_index("name").loc[name_b, "val_mae_mean"],
+            "a_se": table.set_index("name").loc[name_a, "val_mae_se"],
+            "b_se": table.set_index("name").loc[name_b, "val_mae_se"],
+            "diff_mean": diff.mean(),
+            # SE of the difference: sample standard deviation of the 5 fold differences / sqrt(5).
+            "diff_se": diff.std(ddof=1) / np.sqrt(len(diff))}
+    for number, value in enumerate(diff):
+        line["diff_fold_" + str(number + 1)] = value
+    return line
+
+
+def best_name(table, family=None, inputs=None):
+    """The name of the candidate with the lowest mean validation MAE,
+    inside 1 family and / or 1 input set if they are given."""
+    if family is not None:
+        table = table[table["family"] == family]
+    if inputs is not None:
+        table = table[table["inputs"] == inputs]
+    return table.loc[table["val_mae_mean"].idxmin(), "name"]
+
+
+def learning_curve(table, names):
+    """Train the given candidates on 20, 40, 60, 80 and 100 % of the training
+    rows of each fold and score them on the same validation part."""
+    df = load_features()
+    lines = []
+    fold = 0
+    for val_season, train_part, val_part in make_folds(df):
+        fold = fold + 1
+        for name in names:
+            cand = table.set_index("name").loc[name]
+            columns = INPUT_SETS[cand["inputs"]]
+            for share in CURVE_SHARES:
+                if share < 1:
+                    # A random subset, always the same one because of the seed.
+                    # sort_index puts the rows back in their original order.
+                    subset = train_part.sample(frac=share, random_state=CURVE_SEED).sort_index()
+                else:
+                    subset = train_part
+                model = make_model(cand["family"], cand["value"])
+                model.fit(subset[columns], subset[TARGET])
+                lines.append({"name": name, "fold": fold, "val_season": val_season,
+                              "share": share, "n_train_rows": len(subset),
+                              "train_mae": mae(subset, model.predict(subset[columns])),
+                              "val_mae": mae(val_part, model.predict(val_part[columns]))})
+    return pd.DataFrame(lines)
+
+
+def importance_table(depth):
+    """Fit the forest with the FULL inputs on all training seasons and list
+    its feature_importances_ (they add up to 1), sorted."""
+    df = load_features()
+    train = df[df["season"].isin(TRAIN_SEASONS)]
+    columns = INPUT_SETS["FULL"]
+    model = make_forest(depth)
+    model.fit(train[columns], train[TARGET])
+    table = pd.DataFrame({"feature": columns,
+                          "importance": model.named_steps["forest"].feature_importances_})
+    table["depth"] = depth
+    return table.sort_values("importance", ascending=False).reset_index(drop=True)
+
+
+def run_models():
+    """The whole step 5. Every rule is applied in the order it was written down."""
+    # 1. The 2 families on the 2 input sets, with the grids fixed in advance.
+    candidates = []
+    for inputs in INPUT_SETS:
+        for alpha in ALPHA_GRID:
+            candidates.append(("ridge", inputs, alpha))
+        for depth in DEPTH_GRID:
+            candidates.append(("forest", inputs, depth))
+    print("scoring", len(candidates), "candidates of the grids")
+    scores = score_candidates(candidates)
+    scores["round"] = "grid"
+
+    # 2. Completing the forest grid: once, per input set, before any selection.
+    table = candidate_table(scores)
+    extra = []
+    for inputs in INPUT_SETS:
+        forest = table[(table["family"] == "forest") & (table["inputs"] == inputs)]
+        best_depth = forest.loc[forest["val_mae_mean"].idxmin(), "value"]
+        print("forest", inputs, ": best depth of the grid:", best_depth,
+              " added:", EXTRA_DEPTHS[best_depth])
+        for depth in EXTRA_DEPTHS[best_depth]:
+            extra.append(("forest", inputs, depth))
+    more = score_candidates(extra)
+    more["round"] = "completed forest grid"
+    scores = pd.concat([scores, more], ignore_index=True)
+
+    # 3. Selection: the one standard error rule on ALL candidates together.
+    table = candidate_table(scores)
+    choice = one_se_rule(table)
+    edge_rule = "not used"
+    first_choice = choice["chosen"]
+
+    # 4. Edge rule: chosen = ridge with the largest alpha of the grid.
+    chosen = table.set_index("name").loc[choice["chosen"]]
+    if chosen["family"] == "ridge" and chosen["value"] == max(ALPHA_GRID):
+        edge_rule = "used"
+        print("edge rule: adding the alphas", EDGE_ALPHAS, "for both input sets")
+        extra = [("ridge", inputs, alpha) for inputs in INPUT_SETS for alpha in EDGE_ALPHAS]
+        more = score_candidates(extra)
+        more["round"] = "edge rule"
+        scores = pd.concat([scores, more], ignore_index=True)
+        table = candidate_table(scores)
+        choice = one_se_rule(table)             # steps 1 to 4 again, only this once
+    final = choice["chosen"]
+
+    # Write down the result of the rule next to the numbers.
+    table["eligible"] = table["name"].isin(choice["eligible"])
+    table["lowest_mean"] = table["name"] == choice["best"]
+    table["final_model"] = table["name"] == final
+    selection = pd.DataFrame([{"best": choice["best"], "best_mean": choice["best_mean"],
+                               "se": choice["se"], "threshold": choice["threshold"],
+                               "n_candidates": len(table), "n_eligible": len(choice["eligible"]),
+                               "final_model": final, "edge_rule": edge_rule,
+                               "choice_before_edge_rule": first_choice}])
+
+    # 5. Reports that do not change the choice.
+    # Inside each family and input set: lowest mean, and the one SE pick of the group alone.
+    lines = []
+    for family in ["ridge", "forest"]:
+        for inputs in INPUT_SETS:
+            group = table[(table["family"] == family) & (table["inputs"] == inputs)]
+            inside = one_se_rule(group)
+            lines.append({"family": family, "inputs": inputs,
+                          "lowest_mean": inside["best"], "lowest_mean_mae": inside["best_mean"],
+                          "se": inside["se"], "threshold": inside["threshold"],
+                          "one_se_pick": inside["chosen"],
+                          "one_se_pick_mae": group.set_index("name").loc[inside["chosen"], "val_mae_mean"]})
+    groups = pd.DataFrame(lines)
+
+    # Load hypothesis (per family: best FULL against best NO_LOAD), and ridge against forest.
+    best_ridge = best_name(table, family="ridge")
+    best_forest = best_name(table, family="forest")
+    comparisons = pd.DataFrame([
+        compare(scores, table, best_name(table, "ridge", "FULL"),
+                best_name(table, "ridge", "NO_LOAD"), "load, ridge: FULL minus NO_LOAD"),
+        compare(scores, table, best_name(table, "forest", "FULL"),
+                best_name(table, "forest", "NO_LOAD"), "load, forest: FULL minus NO_LOAD"),
+        compare(scores, table, best_ridge, best_forest, "ridge minus forest"),
+    ])
+
+    # Rows without and with history, best ridge and best forest.
+    history = table[table["name"].isin([best_ridge, best_forest])][
+        ["name", "val_mae_mean", "val_mae_std",
+         "val_mae_no_history_mean", "val_mae_no_history_std",
+         "val_mae_with_history_mean", "val_mae_with_history_std"]]
+
+    # 6. Looks that choose nothing.
+    depth_curve = table[table["family"] == "forest"][
+        ["inputs", "value", "name", "train_mae_mean", "val_mae_mean", "val_mae_se"]]
+    depth_curve = depth_curve.sort_values(["inputs", "value"])
+
+    # Learning curve: the final model and the best candidate of the other family.
+    final_family = table.set_index("name").loc[final, "family"]
+    other = best_forest if final_family == "ridge" else best_ridge
+    print("learning curve:", final, "and", other)
+    curve_folds = learning_curve(table, [final, other])
+    curve = curve_folds.groupby(["name", "share"])[["n_train_rows", "train_mae", "val_mae"]].mean().reset_index()
+    curve["role"] = np.where(curve["name"] == final, "final model", "best of the other family")
+
+    # Forest importances: FULL inputs, the depth with the lowest mean.
+    forest_full = table[(table["family"] == "forest") & (table["inputs"] == "FULL")]
+    importance = importance_table(forest_full.loc[forest_full["val_mae_mean"].idxmin(), "value"])
+
+    # 7. Save and print.
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    tables = {"models_scores_per_fold": scores, "models_candidates": table,
+              "models_selection": selection, "models_groups": groups,
+              "models_comparisons": comparisons, "models_history": history,
+              "models_depth_curve": depth_curve, "models_learning_curve": curve,
+              "models_learning_curve_per_fold": curve_folds,
+              "models_importance": importance}
+    for name, one in tables.items():
+        one.to_csv(os.path.join(OUTPUT_DIR, name + ".csv"), index=False)
+
+    print("\n--- all candidates, best mean validation MAE first ---")
+    show = ["name", "train_mae_mean", "val_mae_mean", "val_mae_std", "val_mae_se",
+            "val_rmse_mean", "val_r2_mean", "val_spearman_mean", "val_top10_mean",
+            "eligible", "final_model"]
+    print(table[show].round(4).to_string(index=False))
+
+    print("\n--- selection: the one standard error rule on all", len(table), "candidates ---")
+    print("lowest mean validation MAE:", choice["best"], " mean:", round(choice["best_mean"], 5))
+    print("SE:", round(choice["se"], 5), "  threshold = mean + SE:", round(choice["threshold"], 5))
+    print("eligible candidates:", len(choice["eligible"]))
+    print("simplest eligible first:")
+    print(simplest_first(table[table["eligible"]])[["name", "val_mae_mean"]].round(5).to_string(index=False))
+    print("edge rule:", edge_rule)
+    print("\n==============================================")
+    print("THE FINAL MODEL:", final)
+    print("==============================================")
+
+    print("\n--- inside each family and input set ---")
+    print(groups.round(5).to_string(index=False))
+    print("\n--- comparisons: validation MAE, difference = a minus b ---")
+    print(comparisons.round(5).T.to_string(header=False))
+    print("\n--- validation MAE, rows without and with history ---")
+    print(history.round(4).to_string(index=False))
+    print("\n--- depth curve of the forest ---")
+    print(depth_curve.round(4).to_string(index=False))
+    print("\n--- learning curve: mean over the 5 folds ---")
+    print(curve.round(4).to_string(index=False))
+    print("\n--- forest importances (FULL inputs, depth", importance["depth"].iloc[0], "), all training seasons ---")
+    print(importance[["feature", "importance"]].round(4).to_string(index=False))
+    print("\nsaved in " + OUTPUT_DIR + "/:", ", ".join(name + ".csv" for name in tables))
+
+
 # ------------------------------------------------------------------ main step
 
 def make_features():
@@ -745,5 +1115,7 @@ if __name__ == "__main__":
         show_split()
     elif len(sys.argv) == 2 and sys.argv[1] == "baselines":
         run_baselines()
+    elif len(sys.argv) == 2 and sys.argv[1] == "models":
+        run_models()
     else:
-        print("usage: python pipeline.py features   or   split   or   baselines")
+        print("usage: python pipeline.py features   or   split   or   baselines   or   models")
