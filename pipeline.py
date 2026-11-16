@@ -3,6 +3,7 @@
 #
 #   python pipeline.py features    build data/features.csv
 #   python pipeline.py split       print the season split and the validation folds
+#   python pipeline.py baselines   score the 3 baseline models, save the tables in outputs/
 #
 # About "features":
 # It reads data/sprints_raw.csv and data/races_all.csv, cleans them, builds
@@ -11,15 +12,21 @@
 #
 # Golden rule: a feature of a race only uses races that started BEFORE it.
 
+import os
 import sys
 import zlib
 
 import numpy as np
 import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 SPRINT_FILE = "data/sprints_raw.csv"    # sprints with split times (from download_sprints.py)
 RACES_FILE = "data/races_all.csv"       # all formats, results only (from download_races.py)
 FEATURES_FILE = "data/features.csv"     # what this step creates
+OUTPUT_DIR = "outputs"                  # the score tables of step 4 go here
 
 RELAY_CODES = ["RL", "SR"]              # relay and single mixed relay
 
@@ -68,6 +75,24 @@ CANCELLED_RACES = [
     "BT1920SWRLCP09SMPU", "BT1920SWRLCP09SWMS", "BT1920SWRLCP09SMMS",
     "BT2223SWRLCP09SWPU",
 ]
+
+# Step 4, the ridge model. Alpha says how strongly the weights are pulled
+# towards 0. These rules were fixed BEFORE looking at any result:
+# - try every alpha of the grid,
+# - take the alpha with the lowest mean validation MAE over the 5 folds,
+# - tie rule: round the mean MAE to 3 decimals; among the alphas that share
+#   the best rounded value, take the largest (the simplest model),
+# - edge rule: if the chosen alpha is the smallest or the largest of the
+#   grid, add 2 more steps of 10 on that side and choose again. Only once.
+ALPHA_GRID = [0.01, 0.1, 1, 10, 100, 1000]
+MAE_DECIMALS = 3        # the rounding of the tie rule
+EDGE_STEPS = 2          # how many steps of 10 the edge rule adds
+
+# The value the simple models predict when they know nothing: the middle.
+MIDDLE = 0.5
+
+# The 5 scores of step 4, in the order of the tables.
+SCORES = ["mae", "rmse", "r2", "spearman", "top10"]
 
 # The 13 features, in the order of the project brief.
 FEATURES = [
@@ -381,6 +406,23 @@ def mae(rows, pred):
     return np.mean(np.abs(np.asarray(pred) - rows[TARGET].to_numpy()))
 
 
+def rmse(rows, pred):
+    """Root mean squared error: like the MAE, but big errors count more,
+    because every error is squared before the mean is taken."""
+    errors = np.asarray(pred) - rows[TARGET].to_numpy()
+    return np.sqrt(np.mean(errors ** 2))
+
+
+def r2(rows, pred):
+    """R2: the share of the spread of the truth that the prediction explains.
+    1 = perfect. 0 = as good as predicting the mean of the truth for all.
+    Below 0 = worse than that."""
+    true = rows[TARGET].to_numpy()
+    left_over = np.sum((true - np.asarray(pred)) ** 2)     # squared errors of the model
+    spread = np.sum((true - true.mean()) ** 2)             # squared errors of "always the mean"
+    return 1 - left_over / spread
+
+
 def mean_spearman(rows, pred):
     """Rank correlation between prediction and truth in each race, then the
     mean over the races. 1 = same order, 0 = no link."""
@@ -426,8 +468,10 @@ def top_n_hit_rate(rows, pred):
 
 
 def all_metrics(rows, pred):
-    """The 3 metrics together, as a small dictionary."""
+    """The 5 metrics together, as a small dictionary."""
     return {"mae": mae(rows, pred),
+            "rmse": rmse(rows, pred),
+            "r2": r2(rows, pred),
             "spearman": mean_spearman(rows, pred),
             "top10": top_n_hit_rate(rows, pred)}
 
@@ -453,6 +497,223 @@ def show_split():
         seasons = train_part["season"].unique()
         show_size("train " + seasons.min() + "-" + seasons.max(), train_part)
         show_size("  validate " + val_season, val_part)
+
+
+# ------------------------------------------------------------------ baselines
+# Step 4: 3 simple models, scored on the 5 walk forward folds.
+
+def predict_constant(rows):
+    """Model 1: the same value, 0.5, for everybody. It knows nothing."""
+    return np.full(len(rows), MIDDLE)
+
+
+def predict_naive(rows):
+    """Model 2: the mean finish percentile of the last 3 sprints, as it is.
+    Where this value is empty (no previous sprint), 0.5. Nothing is learned."""
+    return rows["last3_finish_pct"].fillna(MIDDLE).to_numpy()
+
+
+def make_ridge(alpha):
+    """Model 3: 3 steps in a row, in 1 scikit-learn Pipeline.
+    fill:  put the median of the column into the empty cells,
+    scale: bring every column to mean 0 and spread 1,
+    ridge: a linear model whose weights are pulled towards 0 by alpha.
+    When we call fit, each step learns its numbers (medians, means and
+    spreads, weights) from the rows given to fit, and from no other row."""
+    return Pipeline([("fill", SimpleImputer(strategy="median")),
+                     ("scale", StandardScaler()),
+                     ("ridge", Ridge(alpha=alpha))])
+
+
+def score_line(model, alpha, fold, val_season, part, rows, pred):
+    """1 line of the score table: who was scored, on which rows, and the 5 scores."""
+    line = {"model": model, "alpha": alpha, "fold": fold,
+            "val_season": val_season, "part": part, "n_rows": len(rows)}
+    line.update(all_metrics(rows, pred))
+    # The MAE again, separately for the rows without and with a previous sprint.
+    pred = np.asarray(pred)
+    new = (rows["no_history"] == 1).to_numpy()
+    line["n_no_history"] = int(new.sum())
+    line["mae_no_history"] = mae(rows[new], pred[new])
+    line["mae_with_history"] = mae(rows[~new], pred[~new])
+    return line
+
+
+def score_models(alphas, with_simple=True):
+    """Score the models on the training part and the validation part of each
+    fold. Returns 1 long table with 1 line per model, alpha, fold and part.
+    with_simple=False scores only the ridge models (used by the edge rule)."""
+    df = load_features()            # the test seasons are already removed here
+    lines = []
+    fold = 0
+    for val_season, train_part, val_part in make_folds(df):
+        fold = fold + 1
+        parts = [("train", train_part), ("validation", val_part)]
+
+        if with_simple:
+            for part, rows in parts:
+                lines.append(score_line("constant", np.nan, fold, val_season,
+                                        part, rows, predict_constant(rows)))
+                lines.append(score_line("naive", np.nan, fold, val_season,
+                                        part, rows, predict_naive(rows)))
+
+        for alpha in alphas:
+            model = make_ridge(alpha)
+            # fit sees the training part of this fold only. The medians, the
+            # scaling and the weights all come from these rows.
+            model.fit(train_part[FEATURES], train_part[TARGET])
+            for part, rows in parts:
+                pred = model.predict(rows[FEATURES])
+                lines.append(score_line("ridge", alpha, fold, val_season,
+                                        part, rows, pred))
+    return pd.DataFrame(lines)
+
+
+def alpha_table(scores):
+    """Mean MAE of the ridge model for each alpha, on train and on validation."""
+    ridge = scores[scores["model"] == "ridge"]
+    table = ridge.pivot_table(index="alpha", columns="part", values="mae", aggfunc="mean")
+    table = table.rename(columns={"train": "train_mae", "validation": "val_mae"})
+    table["val_mae_rounded"] = table["val_mae"].round(MAE_DECIMALS)
+    return table.sort_index().reset_index()
+
+
+def choose_alpha(table):
+    """Apply the choice rule and the tie rule to an alpha table.
+    Returns the chosen alpha and the alphas that share the best rounded MAE."""
+    best = table["val_mae_rounded"].min()
+    tied = table[table["val_mae_rounded"] == best]["alpha"].tolist()
+    return max(tied), tied          # the tie rule: the largest of them
+
+
+def find_alpha():
+    """Score all models and choose the alpha, with the rules fixed in advance.
+    Returns the score table, the alpha table and the chosen alpha."""
+    scores = score_models(ALPHA_GRID)
+    scores["round"] = "grid"                    # scored in the first round
+    table = alpha_table(scores)
+    alpha, tied = choose_alpha(table)
+    first_choice = alpha
+    edge_rule = "not used"
+
+    # Edge rule: the chosen alpha sits at an end of the grid, so the best
+    # value could lie outside. Add 2 steps of 10 on that side, choose again.
+    if alpha == max(ALPHA_GRID) or alpha == min(ALPHA_GRID):
+        if alpha == max(ALPHA_GRID):
+            extra = [alpha * 10 ** step for step in range(1, EDGE_STEPS + 1)]
+            edge_rule = "used at the largest alpha"
+        else:
+            extra = [alpha / 10 ** step for step in range(1, EDGE_STEPS + 1)]
+            edge_rule = "used at the smallest alpha"
+        more = score_models(extra, with_simple=False)
+        more["round"] = "edge rule"
+        scores = pd.concat([scores, more], ignore_index=True)
+        table = alpha_table(scores)
+        alpha, tied = choose_alpha(table)       # choose again, only this once
+
+    # Write down how the choice was made, next to the numbers.
+    table["first_grid"] = table["alpha"].isin(ALPHA_GRID)
+    table["chosen"] = table["alpha"] == alpha
+    table["shares_best_rounded_mae"] = table["alpha"].isin(tied)
+    table["tie_rule"] = "used" if len(tied) > 1 else "not used"
+    table["edge_rule"] = edge_rule
+    table["first_choice"] = first_choice
+    return scores, table, alpha
+
+
+def summary_table(scores):
+    """Mean and standard deviation over the 5 folds, for every model, alpha
+    and part. The standard deviation is the usual one (divided by 5 - 1)."""
+    keys = ["model", "alpha", "part"]
+    numbers = SCORES + ["mae_no_history", "mae_with_history"]
+    # dropna=False keeps the constant and the naive model, which have no alpha.
+    table = scores.groupby(keys, dropna=False)[numbers].agg(["mean", "std"])
+    table.columns = [score + "_" + what for score, what in table.columns]
+    return table.reset_index()
+
+
+def ladder_table(summary, alpha):
+    """The 3 models next to each other: constant, naive, ridge at the chosen alpha."""
+    keep = (summary["model"] != "ridge") | (summary["alpha"] == alpha)
+    ladder = summary[keep].copy()
+    # Put the lines in the order of the ladder: constant, naive, ridge.
+    order = {"constant": 1, "naive": 2, "ridge": 3}
+    ladder["order"] = ladder["model"].map(order)
+    ladder = ladder.sort_values(["order", "part"]).drop(columns="order")
+    columns = ["model", "alpha", "part"] + [s + "_" + w for s in SCORES for w in ["mean", "std"]]
+    return ladder[columns].reset_index(drop=True)
+
+
+def history_table(summary, alpha):
+    """Validation MAE of the 3 models for the rows without and with history."""
+    ladder = summary[(summary["model"] != "ridge") | (summary["alpha"] == alpha)]
+    val = ladder[ladder["part"] == "validation"]
+    order = {"constant": 1, "naive": 2, "ridge": 3}
+    val = val.sort_values("model", key=lambda col: col.map(order))
+    return val[["model", "alpha", "mae_mean", "mae_std",
+                "mae_no_history_mean", "mae_no_history_std",
+                "mae_with_history_mean", "mae_with_history_std"]].reset_index(drop=True)
+
+
+def weights_table(alpha):
+    """Fit the ridge model on ALL training seasons and list its weights.
+    The inputs were scaled, so the weights can be compared with each other:
+    a weight says how much the prediction moves when the feature goes up by
+    1 standard deviation."""
+    df = load_features()
+    train = df[df["season"].isin(TRAIN_SEASONS)]
+    model = make_ridge(alpha)
+    model.fit(train[FEATURES], train[TARGET])
+    table = pd.DataFrame({"feature": FEATURES,
+                          "weight": model.named_steps["ridge"].coef_,
+                          "fill_median": model.named_steps["fill"].statistics_})
+    table["size"] = table["weight"].abs()
+    table = table.sort_values("size", ascending=False).reset_index(drop=True)
+    table["alpha"] = alpha
+    table["intercept"] = model.named_steps["ridge"].intercept_
+    return table
+
+
+def load_output(name):
+    """Load 1 of the tables that 'python pipeline.py baselines' saved in outputs/."""
+    return pd.read_csv(os.path.join(OUTPUT_DIR, name + ".csv"), dtype={"val_season": str})
+
+
+def run_baselines():
+    """The whole step 4: score, choose the alpha, save the tables, print."""
+    scores, alphas, alpha = find_alpha()
+    summary = summary_table(scores)
+    ladder = ladder_table(summary, alpha)
+    history = history_table(summary, alpha)
+    weights = weights_table(alpha)
+
+    # Save every table as a file.
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    tables = {"baselines_scores_per_fold": scores,
+              "baselines_summary": summary,
+              "baselines_alpha": alphas,
+              "baselines_ladder": ladder,
+              "baselines_history": history,
+              "baselines_weights": weights}
+    for name, table in tables.items():
+        table.to_csv(os.path.join(OUTPUT_DIR, name + ".csv"), index=False)
+
+    print("--- alpha: mean MAE over the 5 folds ---")
+    print(alphas[["alpha", "train_mae", "val_mae", "val_mae_rounded", "first_grid", "chosen"]]
+          .round(5).to_string(index=False))
+    print("chosen alpha:", alpha, "  tie rule:", alphas["tie_rule"].iloc[0],
+          "  edge rule:", alphas["edge_rule"].iloc[0])
+
+    print("\n--- the ladder: mean and standard deviation over the 5 folds ---")
+    print(ladder.round(3).to_string(index=False))
+
+    print("\n--- validation MAE, rows without and with history ---")
+    print(history.round(3).to_string(index=False))
+
+    print("\n--- ridge weights at the chosen alpha, fitted on all training seasons ---")
+    print(weights[["feature", "weight"]].round(4).to_string(index=False))
+
+    print("\nsaved in " + OUTPUT_DIR + "/:", ", ".join(name + ".csv" for name in tables))
 
 
 # ------------------------------------------------------------------ main step
@@ -482,5 +743,7 @@ if __name__ == "__main__":
         make_features()
     elif len(sys.argv) == 2 and sys.argv[1] == "split":
         show_split()
+    elif len(sys.argv) == 2 and sys.argv[1] == "baselines":
+        run_baselines()
     else:
-        print("usage: python pipeline.py features   or   python pipeline.py split")
+        print("usage: python pipeline.py features   or   split   or   baselines")

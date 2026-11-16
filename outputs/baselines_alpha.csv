@@ -1,0 +1,7 @@
+alpha,train_mae,val_mae,val_mae_rounded,first_grid,chosen,shares_best_rounded_mae,tie_rule,edge_rule,first_choice
+0.01,0.1588021050017378,0.1574013643003198,0.157,True,False,True,used,not used,10.0
+0.1,0.15880220494189456,0.1574014447504733,0.157,True,False,True,used,not used,10.0
+1.0,0.15880320452154983,0.15740225349351825,0.157,True,False,True,used,not used,10.0
+10.0,0.1588133259038838,0.15741072438494547,0.157,True,True,True,used,not used,10.0
+100.0,0.15892507580865642,0.15751201247074964,0.158,True,False,False,used,not used,10.0
+1000.0,0.16010736745422177,0.15869263687410745,0.159,True,False,False,used,not used,10.0
