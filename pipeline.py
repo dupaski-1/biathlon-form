@@ -5,6 +5,8 @@
 #   python pipeline.py split       print the season split and the validation folds
 #   python pipeline.py baselines   score the 3 baseline models, save the tables in outputs/
 #   python pipeline.py models      ridge and random forest, choose the final model
+#   python pipeline.py robustness  step 6, part A: the step 5 candidates on a sliding window
+#   python pipeline.py test        step 6, part B: THE FINAL TEST. Opens the test seasons.
 #
 # About "features":
 # It reads data/sprints_raw.csv and data/races_all.csv, cleans them, builds
@@ -21,6 +23,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -142,6 +145,42 @@ EXTRA_DEPTHS = {2: [1, 3], 4: [3, 5], 6: [5, 7], 8: [7, 10],
 # Edge rule of step 5: if the final choice is ridge with the largest alpha
 # of the grid, these 2 alphas are added for both input sets. Once.
 EDGE_ALPHAS = [10000, 100000]
+
+# Step 6, part A: the robustness run. Each validation season is predicted
+# from the WINDOW_SEASONS seasons just before it only (a sliding window),
+# and not from all earlier seasons as in step 5.
+WINDOW_SEASONS = 5
+
+# Step 6, part B: the final test. The final model was chosen in step 5 and
+# is frozen: ridge, the NO_LOAD inputs (9), alpha 1000.
+FINAL_INPUTS = "NO_LOAD"
+FINAL_ALPHA = 1000
+# What we expect to load. If a count is different, the command stops
+# before any test score is computed.
+EXPECTED_TRAIN_ROWS = 18183
+EXPECTED_TEST_ROWS = 4778
+EXPECTED_TEST_RACES = 48
+# Per athlete predictions go to data/ (not in git). outputs/ holds no athlete rows.
+TEST_PREDICTIONS_FILE = "data/test_predictions.csv"
+STORY_FIGURE = "test_story.png"
+# Permutation importance: how often each column is shuffled, and the seed.
+PERM_REPEATS = 20
+PERM_SEED = 42
+# The groups of inputs that are shuffled together.
+INPUT_GROUPS = {
+    "results": ["last3_finish_pct", "last_finish_pct", "last_place_any"],
+    "skiing": ["last3_ski_pct"],
+    "shooting": ["last3_range_pct", "last3_misses"],
+    "experience and timing": ["n_prev_sprints", "days_since_sprint", "no_history"],
+}
+# The limits of the slices.
+PCT_FRONT = 0.10        # real finish percentile up to here = the front of the race
+PCT_BACK = 0.90         # from here on = the back of the race
+DAYS_SHORT = 30         # days since the last sprint: up to 30, 31 to 180, above 180
+DAYS_LONG = 180
+STORY_NUMBER = 24       # the story race: number 24 of the 48 races sorted by MAE
+# The 3 models that are scored on the test seasons, and their column of predictions.
+TEST_MODELS = {"final": "pred_final", "constant": "pred_constant", "naive": "pred_naive"}
 
 # The learning curve: the shares of the training rows, and the seed that
 # picks the random subset.
@@ -417,6 +456,19 @@ def count_test():
     usecols reads only these 2 columns: no feature and no result is loaded."""
     df = pd.read_csv(FEATURES_FILE, dtype={"season": str}, usecols=["season", "race_id"])
     return df[df["season"].isin(TEST_SEASONS)]
+
+
+def make_window_folds(df):
+    """The folds of the robustness run (step 6, part A): the same 5 validation
+    seasons, but each is predicted from the 5 seasons just before it only."""
+    folds = []
+    for val_season in VALIDATION_SEASONS:
+        position = TRAIN_SEASONS.index(val_season)            # where the season is in the list
+        seasons_before = TRAIN_SEASONS[position - WINDOW_SEASONS:position]    # the 5 before it
+        train_part = df[df["season"].isin(seasons_before)]
+        val_part = df[df["season"] == val_season]
+        folds.append((val_season, train_part, val_part))
+    return folds
 
 
 def make_folds(df):
@@ -792,13 +844,15 @@ def candidate_name(family, inputs, value):
     return "forest " + inputs + " depth=" + str(int(value))
 
 
-def score_candidates(candidates):
+def score_candidates(candidates, folds_function=make_folds):
     """Score a list of candidates (family, inputs, value) on the training part
-    and the validation part of each fold. 1 line per candidate, fold and part."""
+    and the validation part of each fold. 1 line per candidate, fold and part.
+    folds_function builds the folds: the walk forward folds of step 3, or the
+    sliding window folds of the robustness run."""
     df = load_features()            # the test seasons are already removed here
     lines = []
     fold = 0
-    for val_season, train_part, val_part in make_folds(df):
+    for val_season, train_part, val_part in folds_function(df):
         fold = fold + 1
         for family, inputs, value in candidates:
             columns = INPUT_SETS[inputs]
@@ -1086,6 +1140,354 @@ def run_models():
     print("\nsaved in " + OUTPUT_DIR + "/:", ", ".join(name + ".csv" for name in tables))
 
 
+# ------------------------------------------------------------------ robustness
+# Step 6, part A. Training and validation seasons only. It changes nothing:
+# it only tells us if the conclusions of step 5 hold with another split.
+
+def run_robustness():
+    """Score the 34 candidates of step 5 again on the sliding window folds
+    and apply the one standard error rule with the same simplicity order."""
+    # The same candidates as in the final table of step 5. No new round.
+    step5 = load_output("models_candidates")
+    candidates = [(line["family"], line["inputs"], line["value"])
+                  for index, line in step5.iterrows()]
+    print("scoring", len(candidates), "candidates on the sliding window folds")
+    scores = score_candidates(candidates, folds_function=make_window_folds)
+
+    table = candidate_table(scores)
+    choice = one_se_rule(table)
+    table["eligible"] = table["name"].isin(choice["eligible"])
+    table["lowest_mean"] = table["name"] == choice["best"]
+    table["one_se_choice"] = table["name"] == choice["chosen"]
+    final_step5 = step5[step5["final_model"]]["name"].iloc[0]
+    table["final_model_of_step_5"] = table["name"] == final_step5
+    selection = pd.DataFrame([{"best": choice["best"], "best_mean": choice["best_mean"],
+                               "se": choice["se"], "threshold": choice["threshold"],
+                               "n_candidates": len(table), "n_eligible": len(choice["eligible"]),
+                               "one_se_choice": choice["chosen"],
+                               "final_model_of_step_5": final_step5}])
+
+    comparisons = pd.DataFrame([
+        compare(scores, table, best_name(table, family="ridge"),
+                best_name(table, family="forest"), "ridge minus forest"),
+        compare(scores, table, best_name(table, "ridge", "FULL"),
+                best_name(table, "ridge", "NO_LOAD"), "load, ridge: FULL minus NO_LOAD"),
+        compare(scores, table, best_name(table, "forest", "FULL"),
+                best_name(table, "forest", "NO_LOAD"), "load, forest: FULL minus NO_LOAD"),
+    ])
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    tables = {"robustness_scores_per_fold": scores, "robustness_candidates": table,
+              "robustness_selection": selection, "robustness_comparisons": comparisons}
+    for name, one in tables.items():
+        one.to_csv(os.path.join(OUTPUT_DIR, name + ".csv"), index=False)
+
+    print("\n--- sliding window: all candidates, best mean validation MAE first ---")
+    show = ["name", "train_mae_mean", "val_mae_mean", "val_mae_std", "val_mae_se",
+            "eligible", "one_se_choice", "final_model_of_step_5"]
+    print(table[show].round(5).to_string(index=False))
+    print("\n--- the one standard error rule, same simplicity order ---")
+    print("best:", choice["best"], " mean:", round(choice["best_mean"], 5),
+          " SE:", round(choice["se"], 5), " threshold:", round(choice["threshold"], 5))
+    print("eligible:", len(choice["eligible"]), "of", len(table))
+    print("the rule would choose:", choice["chosen"])
+    print("final model of step 5:", final_step5)
+    print("\n--- comparisons: validation MAE, difference = a minus b ---")
+    print(comparisons.round(5).T.to_string(header=False))
+    print("\nsaved in " + OUTPUT_DIR + "/:", ", ".join(name + ".csv" for name in tables))
+
+
+# ------------------------------------------------------------------ final test
+# Step 6, part B. The functions below get the training rows and the test rows
+# as 2 tables. Only run_test() loads the real test rows.
+
+def load_test_rows():
+    """Load the rows of the TEST seasons from data/features.csv.
+    Only the command 'python pipeline.py test' may call this function."""
+    df = pd.read_csv(FEATURES_FILE, dtype={"season": str})
+    return df[df["season"].isin(TEST_SEASONS)].reset_index(drop=True)
+
+
+def load_test_predictions():
+    """Load the per athlete predictions that the test command saved in data/."""
+    return pd.read_csv(TEST_PREDICTIONS_FILE, dtype={"season": str})
+
+
+def fit_final_model(train):
+    """Fit the frozen final pipeline on the given training rows."""
+    model = make_ridge(FINAL_ALPHA)
+    model.fit(train[INPUT_SETS[FINAL_INPUTS]], train[TARGET])
+    return model
+
+
+def add_predictions(model, rows):
+    """Add the predictions of the 3 models to the rows, and the places."""
+    rows = rows.copy()
+    rows["pred_final"] = model.predict(rows[INPUT_SETS[FINAL_INPUTS]])
+    rows["pred_constant"] = predict_constant(rows)
+    rows["pred_naive"] = predict_naive(rows)
+    # The real place, found again from the percentile: pct = (place - 1) / (n - 1).
+    rows["n_finishers"] = rows.groupby("race_id")[TARGET].transform("count")
+    rows["real_place"] = (rows[TARGET] * (rows["n_finishers"] - 1)).round().astype(int) + 1
+    # The predicted rank: the order of the predictions inside the race, 1 = lowest.
+    rows["pred_rank"] = rows.groupby("race_id")["pred_final"].rank(method="min").astype(int)
+    # The same prediction written as a place: place = pct * (n - 1) + 1.
+    rows["pred_place"] = rows["pred_final"] * (rows["n_finishers"] - 1) + 1
+    rows["error"] = rows["pred_final"] - rows[TARGET]          # prediction minus real
+    rows["abs_error"] = rows["error"].abs()
+    return rows
+
+
+def test_score_table(rows):
+    """The 5 scores of the 3 models: all seasons together, then each season."""
+    scopes = [("all", rows)]
+    for season in sorted(rows["season"].unique()):
+        scopes.append((season, rows[rows["season"] == season]))
+    lines = []
+    for scope, part in scopes:
+        for model, column in TEST_MODELS.items():
+            line = {"scope": scope, "model": model, "rows": len(part),
+                    "races": part["race_id"].nunique()}
+            line.update(all_metrics(part, part[column]))
+            lines.append(line)
+    return pd.DataFrame(lines)
+
+
+def test_race_table(rows):
+    """1 line per race: the MAE of the 3 models. No athlete in this table."""
+    lines = []
+    for race_id, race in rows.groupby("race_id"):
+        line = {"race_id": race_id, "season": race["season"].iloc[0],
+                "day": race["start"].iloc[0][:10], "place": race["place"].iloc[0],
+                "gender": race["gender"].iloc[0],
+                "is_major_event": race["is_major_event"].iloc[0], "rows": len(race)}
+        for model, column in TEST_MODELS.items():
+            line["mae_" + model] = mae(race, race[column])
+        lines.append(line)
+    table = pd.DataFrame(lines)
+    # Number the races from the lowest MAE of the final model to the highest.
+    table = table.sort_values(["mae_final", "race_id"]).reset_index(drop=True)
+    table["number_by_mae"] = table.index + 1
+    table["story_race"] = table["number_by_mae"] == STORY_NUMBER
+    return table.sort_values(["day", "race_id"]).reset_index(drop=True)
+
+
+def test_slice_table(rows):
+    """The MAE and the mean signed error (prediction minus real) of the
+    3 models in each group of the 5 slices."""
+    real = rows[TARGET]
+    days = rows["days_since_sprint"]
+    slices = [
+        ("a) championship", "World Championships and Olympics", rows["is_major_event"] == True),
+        ("a) championship", "other sprints", rows["is_major_event"] == False),
+        ("b) history", "no_history = 1", rows["no_history"] == 1),
+        ("b) history", "no_history = 0", rows["no_history"] == 0),
+        ("c) gender", "men", rows["gender"] == "SM"),
+        ("c) gender", "women", rows["gender"] == "SW"),
+        ("d) real finish percentile", "up to 0.10", real <= PCT_FRONT),
+        ("d) real finish percentile", "between", (real > PCT_FRONT) & (real < PCT_BACK)),
+        ("d) real finish percentile", "0.90 and above", real >= PCT_BACK),
+        ("e) days since the last sprint", "up to 30", days <= DAYS_SHORT),
+        ("e) days since the last sprint", "31 to 180", (days > DAYS_SHORT) & (days <= DAYS_LONG)),
+        ("e) days since the last sprint", "above 180", days > DAYS_LONG),
+        ("e) days since the last sprint", "no history (apart)", days.isna()),
+    ]
+    lines = []
+    for slice_name, group, keep in slices:
+        part = rows[keep]
+        for model, column in TEST_MODELS.items():
+            lines.append({"slice": slice_name, "group": group, "model": model,
+                          "rows": len(part), "races": part["race_id"].nunique(),
+                          "mae": mae(part, part[column]) if len(part) > 0 else np.nan,
+                          "mean_signed_error": (part[column] - part[TARGET]).mean()})
+    return pd.DataFrame(lines)
+
+
+def test_permutation_table(model, rows):
+    """Permutation importance of the final model: shuffle 1 input (or 1 group
+    of inputs) between the rows, and see how much the MAE goes up. A big
+    increase means the model needs this input. 20 repeats, sample standard
+    deviation (ddof = 1)."""
+    columns = INPUT_SETS[FINAL_INPUTS]
+    X = rows[columns]
+    y = rows[TARGET]
+    lines = []
+
+    # a) Each input alone, with the function of scikit-learn. Its score is
+    # "minus MAE" (higher = better), so its importance is the increase in MAE.
+    result = permutation_importance(model, X, y, scoring="neg_mean_absolute_error",
+                                    n_repeats=PERM_REPEATS, random_state=PERM_SEED)
+    for number, name in enumerate(columns):
+        increases = result.importances[number]             # the 20 increases of this input
+        lines.append({"version": "a) each input alone", "name": name, "inputs": name,
+                      "mae_increase_mean": increases.mean(),
+                      "mae_increase_std": increases.std(ddof=1)})
+
+    # b) By group: the columns of a group get the SAME new row order, so the
+    # values of the group stay together and only their link to the athlete is cut.
+    base = mae(rows, model.predict(X))
+    for group, members in INPUT_GROUPS.items():
+        rng = np.random.RandomState(PERM_SEED)             # the same seed for every group
+        increases = []
+        for repeat in range(PERM_REPEATS):
+            order = rng.permutation(len(X))                # a random order of the rows
+            shuffled = X.copy()
+            shuffled[members] = X[members].to_numpy()[order]
+            increases.append(mae(rows, model.predict(shuffled)) - base)
+        increases = np.array(increases)
+        lines.append({"version": "b) by group", "name": group, "inputs": ", ".join(members),
+                      "mae_increase_mean": increases.mean(),
+                      "mae_increase_std": increases.std(ddof=1)})
+
+    table = pd.DataFrame(lines)
+    table["mae_not_shuffled"] = base
+    table["repeats"] = PERM_REPEATS
+    return table.sort_values(["version", "mae_increase_mean"], ascending=[True, False]).reset_index(drop=True)
+
+
+def final_weights_table(model):
+    """The weights of the fitted final model, sorted by size, with the numbers
+    that the fill step and the scale step learned."""
+    table = pd.DataFrame({"feature": INPUT_SETS[FINAL_INPUTS],
+                          "weight": model.named_steps["ridge"].coef_,
+                          "fill_median": model.named_steps["fill"].statistics_,
+                          "scale_mean": model.named_steps["scale"].mean_,
+                          "scale_spread": model.named_steps["scale"].scale_})
+    table["size"] = table["weight"].abs()
+    table = table.sort_values("size", ascending=False).reset_index(drop=True)
+    table["alpha"] = model.named_steps["ridge"].alpha
+    table["intercept"] = model.named_steps["ridge"].intercept_
+    return table
+
+
+def draw_story(race, title, path=None):
+    """The story figure: predicted rank against real rank in 1 race,
+    1 dot per athlete, no names. If a path is given, the figure is saved."""
+    import matplotlib.pyplot as plt
+    n = len(race)
+    fig, ax = plt.subplots(figsize=(6.5, 6.5))
+    ax.plot([1, n], [1, n], color="#52514e", linewidth=1, linestyle="--",
+            label="perfect prediction")
+    ax.scatter(race["real_place"], race["pred_rank"], s=28, color="#2a78d6",
+               edgecolor="white", linewidth=0.6, label="1 athlete")
+    ax.set_xlabel("real rank")
+    ax.set_ylabel("predicted rank")
+    ax.set_title(title)
+    ax.set_xlim(0, n + 2)
+    ax.set_ylim(0, n + 2)
+    ax.set_aspect("equal")
+    ax.grid(color="#e5e4e0", linewidth=0.8)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(frameon=False, loc="upper left")
+    fig.tight_layout()
+    if path is not None:
+        fig.savefig(path, dpi=150)
+    return fig
+
+
+def story_title(race_line):
+    """The title of the story figure, made from the line of the race table."""
+    who = "men" if race_line["gender"] == "SM" else "women"
+    return (race_line["place"] + ", " + race_line["day"] + ", " + who
+            + "\nMAE " + format(race_line["mae_final"], ".3f")
+            + " (number " + str(STORY_NUMBER) + " of the races sorted by MAE)")
+
+
+def test_tables(train, test):
+    """Everything of part B for the given training rows and test rows:
+    fit the final model on the training rows, predict the test rows, and
+    build every table. Nothing is saved here."""
+    model = fit_final_model(train)
+    rows = add_predictions(model, test)
+    return {"model": model,
+            "predictions": rows,
+            "scores": test_score_table(rows),
+            "races": test_race_table(rows),
+            "slices": test_slice_table(rows),
+            "permutation": test_permutation_table(model, rows),
+            "weights": final_weights_table(model)}
+
+
+def load_test_data():
+    """Load the training rows and the test rows of the final test, and check
+    them. If a check fails the command stops here, before any score exists."""
+    df = load_features()                                   # open seasons only
+    train = df[df["season"].isin(TRAIN_SEASONS)]
+    test = load_test_rows()                                # THE TEST SEASONS
+    # The name of the place of each race comes from the file with all races.
+    places = load_races().drop_duplicates("race_id")[["race_id", "place"]]
+    test = test.merge(places, on="race_id", how="left")
+
+    problems = []
+    if len(train) != EXPECTED_TRAIN_ROWS:
+        problems.append("training rows: " + str(len(train)))
+    if len(test) != EXPECTED_TEST_ROWS:
+        problems.append("test rows: " + str(len(test)))
+    if test["race_id"].nunique() != EXPECTED_TEST_RACES:
+        problems.append("test races: " + str(test["race_id"].nunique()))
+    if not train["start"].max() < test["start"].min():
+        problems.append("a training race starts after a test race")
+    if sorted(test["season"].unique()) != TEST_SEASONS:
+        problems.append("test seasons: " + str(sorted(test["season"].unique())))
+    if len(problems) > 0:
+        sys.exit("STOPPED before any test score was computed: " + "; ".join(problems))
+    return train, test
+
+
+def run_test():
+    """Step 6, part B: the final test."""
+    train, test = load_test_data()
+    print("training rows:", len(train), "  seasons", train["season"].min(), "to", train["season"].max(),
+          "  latest start:", train["start"].max()[:10])
+    print("test rows    :", len(test), "  races:", test["race_id"].nunique(),
+          "  seasons", test["season"].min(), "to", test["season"].max(),
+          "  earliest start:", test["start"].min()[:10])
+
+    tables = test_tables(train, test)
+    rows = tables["predictions"]
+    races = tables["races"]
+
+    # Save. outputs/ gets the tables without athletes and the figure.
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    saved = {"test_scores": tables["scores"], "test_mae_per_race": races,
+             "test_slices": tables["slices"], "test_permutation": tables["permutation"],
+             "test_weights": tables["weights"]}
+    for name, one in saved.items():
+        one.to_csv(os.path.join(OUTPUT_DIR, name + ".csv"), index=False)
+    # The per athlete predictions go to data/, which is not in git.
+    keep = ["race_id", "season", "start", "place", "gender", "IBUId", "Name", "Nat",
+            "is_major_event", TARGET, "no_history", "days_since_sprint", "n_finishers",
+            "real_place", "pred_final", "pred_rank", "pred_place", "pred_constant",
+            "pred_naive", "error", "abs_error"]
+    rows[keep].to_csv(TEST_PREDICTIONS_FILE, index=False)
+    # The story figure: the race with the middle MAE.
+    story = races[races["story_race"]].iloc[0]
+    draw_story(rows[rows["race_id"] == story["race_id"]], story_title(story),
+               os.path.join(OUTPUT_DIR, STORY_FIGURE))
+
+    model = tables["model"]
+    print("final model  : ridge, alpha", model.named_steps["ridge"].alpha, ",",
+          len(INPUT_SETS[FINAL_INPUTS]), "inputs:", ", ".join(INPUT_SETS[FINAL_INPUTS]))
+
+    print("\n--- test scores: the 3 seasons together, then each season ---")
+    print(tables["scores"].round(4).to_string(index=False))
+    print("\n--- MAE per race (the final model): summary of the", len(races), "races ---")
+    print(races["mae_final"].describe().round(4).to_string())
+    print("championship sprints:", int(races["is_major_event"].sum()), "(expected 6)")
+    print("\n--- slices: MAE and mean signed error (prediction minus real) ---")
+    print(tables["slices"].round(4).to_string(index=False))
+    print("\n--- permutation importance on the test rows: increase in MAE ---")
+    print(tables["permutation"][["version", "name", "mae_increase_mean", "mae_increase_std"]]
+          .round(5).to_string(index=False))
+    print("\n--- weights of the refitted final model ---")
+    print(tables["weights"][["feature", "weight"]].round(4).to_string(index=False))
+    print("\nstory race:", story["race_id"], story["place"], story["day"],
+          " MAE:", round(story["mae_final"], 4))
+    print("\nsaved in " + OUTPUT_DIR + "/:", ", ".join(name + ".csv" for name in saved),
+          "and", STORY_FIGURE)
+    print("saved in data/ (not in git):", TEST_PREDICTIONS_FILE)
+
+
 # ------------------------------------------------------------------ main step
 
 def make_features():
@@ -1117,5 +1519,9 @@ if __name__ == "__main__":
         run_baselines()
     elif len(sys.argv) == 2 and sys.argv[1] == "models":
         run_models()
+    elif len(sys.argv) == 2 and sys.argv[1] == "robustness":
+        run_robustness()
+    elif len(sys.argv) == 2 and sys.argv[1] == "test":
+        run_test()
     else:
-        print("usage: python pipeline.py features   or   split   or   baselines   or   models")
+        print("usage: python pipeline.py features | split | baselines | models | robustness | test")

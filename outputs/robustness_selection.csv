@@ -1,0 +1,2 @@
+best,best_mean,se,threshold,n_candidates,n_eligible,one_se_choice,final_model_of_step_5
+ridge NO_LOAD alpha=0.01,0.15745552431269105,0.0018633525609196347,0.15931887687361068,34,25,ridge NO_LOAD alpha=1000,ridge NO_LOAD alpha=1000
