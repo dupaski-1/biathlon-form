@@ -37,15 +37,18 @@ RELAY_CODES = ["RL", "SR"]              # relay and single mixed relay
 
 TARGET = "finish_pct"
 
-# Caps: values above the cap are set to the cap.
-# A few athletes come back after years away (up to about 3200 days). Such a
-# huge number would weigh too much in the model. After 1 year without racing,
-# a longer break does not tell us more, so we stop counting at 365 days.
-MAX_DAYS_SINCE = 365
-# The number of previous sprints goes up to 121. After 20 sprints an athlete
-# is simply "experienced", so we stop counting at 20. A second reason: the
-# data starts in 2012, so high counts are not complete anyway.
-MAX_PREV_SPRINTS = 20
+# The window of features 6, 8 and 9: the sprints of the current season
+# before the race, plus the whole previous season.
+# Dispersion index (feature 9), shrunk toward pure luck (index 1), the same
+# idea as the adjusted beta of Vasicek in finance: the raw value of an athlete
+# is mixed with the value 1, and the fewer sprints, the more weight goes to 1.
+# shrunk = (n x D + DISPERSION_PRIOR_WEIGHT x 1) / (n + DISPERSION_PRIOR_WEIGHT).
+# 5 means: the value 1 counts as much as 5 sprints of the athlete.
+DISPERSION_PRIOR_WEIGHT = 5
+# The sample variance (ddof=1) needs at least 2 sprints. With fewer: the index is 1.
+MIN_SPRINTS_DISPERSION = 2
+# A sprint has 2 shootings of 5 targets: 10 shots.
+SHOTS_PER_SPRINT = 10
 
 # The season split. A season is written like "1314" for the winter 2013/14.
 # History only: the first season of the data. Its rows have almost no past
@@ -99,17 +102,20 @@ MIDDLE = 0.5
 # The 5 scores of step 4, in the order of the tables.
 SCORES = ["mae", "rmse", "r2", "spearman", "top10"]
 
-# The 13 features, in the order of the project brief.
+# The 13 features. Changed on 17 Nov: feature 4 and 6 have a new rule,
+# 8 and 9 are new (they replace "days since the last sprint" and "days since
+# the last race day", which were dropped with their 365 day caps).
+# "Window" = the sprints of the current season before the race + the whole previous season.
 FEATURES = [
     "last3_finish_pct",    # 1  mean finish percentile, last 3 sprints
     "last3_ski_pct",       # 2  mean ski percentile, last 3 sprints
     "last3_range_pct",     # 3  mean range percentile, last 3 sprints
-    "last3_misses",        # 4  mean number of misses, last 3 sprints
+    "last3_miss_pct",      # 4  mean miss percentile, last 3 sprints
     "last_finish_pct",     # 5  finish percentile of the last sprint
-    "n_prev_sprints",      # 6  number of previous sprints
+    "n_sprints_window",    # 6  number of sprints in the window
     "last_place_any",      # 7  finish place in the last race of any format, no relays
-    "days_since_sprint",   # 8  days since the last sprint
-    "days_since_race",     # 9  days since the last race day, relays included
+    "window_mean_misses",  # 8  mean misses per sprint in the window
+    "window_miss_dispersion",  # 9  dispersion index of the misses in the window
     "race_days_21d",       # 10 number of race days in the last 21 days, relays included
     "missed_prev_event",   # 11 flag: did not start at the previous event of the season
     "first_start_major",   # 12 flag: first start at this World Championships / Olympics
@@ -263,14 +269,21 @@ def build_target(sprints):
     fin["range_pct"] = percentile(fin["RNGT_s"], fin["race_id"])
 
     fin["misses"] = fin["ShootingTotal"]                   # number of missed targets
+
+    # Miss percentile: rank the finishers of each sprint by misses, fewest
+    # first. Athletes with the same number of misses share their ranks: they
+    # all get the average of these ranks (method="average"). Then the 0 to 1 scale.
+    miss_rank = fin.groupby("race_id")["misses"].rank(method="average")
+    n_finishers = fin.groupby("race_id")["misses"].transform("count")
+    fin["miss_pct"] = (miss_rank - 1) / (n_finishers - 1)
     return fin
 
 
 # ------------------------------------------------------------------ features
 
 def add_sprint_history(fin):
-    """Features 1, 2, 3, 4, 5, 6, 8 and 13: they only need the earlier sprints
-    where the athlete had a valid finish. 'fin' holds exactly those sprints."""
+    """Features 1 to 5 and 13: they only need the earlier sprints where the
+    athlete had a valid finish. 'fin' holds exactly those sprints."""
     # Put the sprints of each athlete in time order.
     fin = fin.sort_values(["IBUId", "start"]).reset_index(drop=True)
     by_athlete = fin.groupby("IBUId")
@@ -285,30 +298,77 @@ def add_sprint_history(fin):
     fin["last3_finish_pct"] = by_athlete[TARGET].transform(mean_last3)
     fin["last3_ski_pct"] = by_athlete["ski_pct"].transform(mean_last3)
     fin["last3_range_pct"] = by_athlete["range_pct"].transform(mean_last3)
-    fin["last3_misses"] = by_athlete["misses"].transform(mean_last3)
+    fin["last3_miss_pct"] = by_athlete["miss_pct"].transform(mean_last3)
 
     # Feature 5: the result of the sprint just before.
     fin["last_finish_pct"] = by_athlete[TARGET].shift(1)
 
-    # Feature 6: cumcount() numbers the lines of an athlete 0, 1, 2, ...
-    # which is the number of sprints before this one.
-    fin["n_prev_sprints"] = by_athlete.cumcount()
-
-    # Feature 8: days between this sprint and the sprint before.
-    # clip(upper=...) sets every value above the cap to the cap. Empty stays empty.
-    fin["days_since_sprint"] = (fin["date"] - by_athlete["date"].shift(1)).dt.days
-    fin["days_since_sprint"] = fin["days_since_sprint"].clip(upper=MAX_DAYS_SINCE)
+    # cumcount() numbers the lines of an athlete 0, 1, 2, ... which is the
+    # number of valid sprints before this one, over the whole history.
+    fin["n_before_all"] = by_athlete.cumcount()
 
     # Feature 13: 1 when there is no earlier sprint.
-    fin["no_history"] = (fin["n_prev_sprints"] == 0).astype(int)
+    fin["no_history"] = (fin["n_before_all"] == 0).astype(int)
+    return fin
 
-    # Cap feature 6 last, after it was used for the flag above.
-    fin["n_prev_sprints"] = fin["n_prev_sprints"].clip(upper=MAX_PREV_SPRINTS)
+
+def previous_season(season):
+    """The season before, like "1314" -> "1213". Empty for the first season."""
+    seasons = HISTORY_SEASONS + TRAIN_SEASONS + TEST_SEASONS      # in time order
+    position = seasons.index(season)
+    if position == 0:
+        return None
+    return seasons[position - 1]
+
+
+def add_window_history(fin):
+    """Features 6, 8 and 9: the sprints with a valid finish in the window =
+    the current season before this race + the whole previous season."""
+    key = ["race_id", "IBUId"]
+    fin["prev_season"] = fin["season"].map(previous_season)
+
+    # Put next to every sprint row ALL valid sprints of the same athlete.
+    past = fin[["IBUId", "season", "start", "misses"]].rename(
+        columns={"season": "h_season", "start": "h_start", "misses": "h_misses"})
+    pairs = fin[key + ["season", "prev_season", "start"]].merge(past, on="IBUId")
+    # Keep the window. The golden rule: only sprints that started BEFORE this one.
+    earlier = pairs["h_start"] < pairs["start"]
+    in_window = (pairs["h_season"] == pairs["season"]) | (pairs["h_season"] == pairs["prev_season"])
+    window = pairs[earlier & in_window]
+
+    # 1 line per sprint row: how many sprints, their mean misses and the
+    # sample variance of their misses (ddof=1, divided by count - 1).
+    stats = window.groupby(key)["h_misses"].agg(n_sprints_window="count",
+                                                window_mean_misses="mean",
+                                                window_miss_var=lambda m: m.var(ddof=1))
+    fin = fin.merge(stats.reset_index(), on=key, how="left")
+
+    # Feature 6: no sprint in the window means 0 (not "unknown"). No cap.
+    fin["n_sprints_window"] = fin["n_sprints_window"].fillna(0).astype(int)
+    # Feature 8 stays empty when the window has no sprint.
+
+    # Feature 9, step 1: the raw dispersion index D = sample variance /
+    # (10 x p x (1 - p)), with p = mean misses / 10, the share of missed shots.
+    # 10 x p x (1 - p) is the variance we would see if every shot were a
+    # coin toss with the same chance p ("pure luck"): D = 1 = as expected,
+    # above 1 = the athlete has good and bad days, below 1 = very regular.
+    n = fin["n_sprints_window"]
+    p = fin["window_mean_misses"] / SHOTS_PER_SPRINT
+    expected = SHOTS_PER_SPRINT * p * (1 - p)
+    raw_index = fin["window_miss_var"] / expected
+    # Step 2: shrink D toward 1. With n sprints, D gets the weight n and the
+    # value 1 gets the weight DISPERSION_PRIOR_WEIGHT.
+    shrunk = (n * raw_index + DISPERSION_PRIOR_WEIGHT * 1) / (n + DISPERSION_PRIOR_WEIGHT)
+    # Step 3: where D cannot be computed (fewer than 2 sprints, or p is 0 or 1,
+    # which would divide by 0), the feature is 1: we know nothing, so we
+    # assume pure luck. The feature is never empty.
+    can_compute = (n >= MIN_SPRINTS_DISPERSION) & (p > 0) & (p < 1)
+    fin["window_miss_dispersion"] = np.where(can_compute, shrunk, 1.0)
     return fin
 
 
 def add_race_history(fin, races):
-    """Features 7, 9, 10, 11 and 12: they need the races of all formats."""
+    """Features 7, 10, 11 and 12: they need the races of all formats."""
     # A sprint row is identified by the race and the athlete.
     key = ["race_id", "IBUId"]
 
@@ -335,7 +395,7 @@ def add_race_history(fin, races):
     solo = solo.sort_values("h_start")
     last_place = solo.groupby(key)["h_rank"].last().rename("last_place_any")
 
-    # Feature 9: days since the most recent race day.
+    # A helper column (no feature): the date of the most recent race day.
     last_day = earlier.groupby(key)["h_date"].max().rename("last_race_date")
 
     # Feature 10: race days in the 21 days before. nunique() counts different
@@ -351,8 +411,6 @@ def add_race_history(fin, races):
     for result in [last_place, last_day, n_recent, n_same]:
         fin = fin.merge(result.reset_index(), on=key, how="left")
 
-    fin["days_since_race"] = (fin["date"] - fin["last_race_date"]).dt.days
-    fin["days_since_race"] = fin["days_since_race"].clip(upper=MAX_DAYS_SINCE)
     # No race day found in the window means 0 race days, not "unknown".
     fin["race_days_21d"] = fin["race_days_21d"].fillna(0).astype(int)
     # Flag 12: major event and no earlier race day at this event. 0 at World Cups.
@@ -408,7 +466,7 @@ def print_checks(out, fin, races):
     one = one.assign(day=one["date"].dt.date)       # the date in a short form for printing
     print("\n--- leak test:", name, "---")
     print("\nHis last 9 valid sprints, raw results (the features of the last 6 are below):")
-    raw_cols = ["day", "place", "Rank", TARGET, "ski_pct", "range_pct", "misses"]
+    raw_cols = ["day", "place", "Rank", TARGET, "ski_pct", "range_pct", "misses", "miss_pct"]
     print(one[raw_cols].tail(9).round(3).to_string(index=False))
 
     print("\nFeatures of his last 6 sprints:")
@@ -439,6 +497,7 @@ def load_fin():
     races = open_seasons(load_races())
     fin = build_target(sprints)
     fin = add_sprint_history(fin)
+    fin = add_window_history(fin)
     fin = add_race_history(fin, races)
     fin["day"] = fin["date"].dt.date        # the date in a short form for printing
     return fin
@@ -1497,6 +1556,7 @@ def make_features():
 
     fin = build_target(sprints)
     fin = add_sprint_history(fin)
+    fin = add_window_history(fin)
     fin = add_race_history(fin, races)
 
     # Keep the columns of the brief, in race and rank order. Missing values
