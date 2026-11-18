@@ -1,2 +1,2 @@
-best,best_mean,se,threshold,n_candidates,n_eligible,final_model,edge_rule,choice_before_edge_rule
-ridge NO_LOAD alpha=0.01,0.15739287067750402,0.001842845468628459,0.15923571614613247,34,25,ridge NO_LOAD alpha=1000,used,ridge NO_LOAD alpha=1000
+best,best_mean,se,threshold,n_candidates,n_eligible,final_model,final_mean,final_raw_rank,edge_rule,choice_before_edge_rule
+boosting NO_LOAD lr=0.02 depth=3,0.1585575111093922,0.001979319368013696,0.1605368304774059,64,56,lasso NO_LOAD alpha=0.01,0.15968705675162212,52,not used,lasso NO_LOAD alpha=0.01

@@ -1,2 +1,2 @@
-best,best_mean,se,threshold,n_candidates,n_eligible,one_se_choice,final_model_of_step_5
-ridge NO_LOAD alpha=0.01,0.15745552431269105,0.0018633525609196347,0.15931887687361068,34,25,ridge NO_LOAD alpha=1000,ridge NO_LOAD alpha=1000
+best,best_mean,se,threshold,n_candidates,n_eligible,one_se_choice,one_se_choice_mean,one_se_choice_raw_rank,final_model_of_step_5,same_model,step5_best,step5_best_mean,step5_se,step5_threshold,step5_n_eligible
+boosting NO_LOAD lr=0.02 depth=3,0.15854401811746974,0.002059805418592273,0.160603823536062,64,54,lasso NO_LOAD alpha=0.01,0.15963616666190356,46,lasso NO_LOAD alpha=0.01,True,boosting NO_LOAD lr=0.02 depth=3,0.1585575111093922,0.0019793193680136,0.1605368304774059,56

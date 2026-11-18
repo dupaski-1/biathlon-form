@@ -1,14 +1,11 @@
-feature,importance,depth
-last3_ski_pct,0.3157484281102151,10.0
-last3_finish_pct,0.3053228330846659,10.0
-last_place_any,0.1629819179175168,10.0
-last_finish_pct,0.09067010261214246,10.0
-last3_range_pct,0.04336582349641466,10.0
-n_prev_sprints,0.023580110363654084,10.0
-last3_misses,0.014294402607351164,10.0
-days_since_race,0.013200662344580663,10.0
-days_since_sprint,0.012984297630958168,10.0
-race_days_21d,0.009104850662678379,10.0
-no_history,0.004345689704287925,10.0
-first_start_major,0.0024914591416119137,10.0
-missed_prev_event,0.0019094223239227797,10.0
+feature,importance,forest,label
+last3_ski_pct,0.3179522133187682,forest NO_LOAD depth=8,first look only
+last3_finish_pct,0.29774259948828635,forest NO_LOAD depth=8,first look only
+last_place_any,0.17346374067407488,forest NO_LOAD depth=8,first look only
+last_finish_pct,0.10654931032345315,forest NO_LOAD depth=8,first look only
+last3_range_pct,0.03004218690120391,forest NO_LOAD depth=8,first look only
+n_sprints_window,0.02537024232230539,forest NO_LOAD depth=8,first look only
+window_mean_misses,0.020908394203640646,forest NO_LOAD depth=8,first look only
+last3_miss_pct,0.0160671482385091,forest NO_LOAD depth=8,first look only
+window_miss_dispersion,0.007532821082383673,forest NO_LOAD depth=8,first look only
+no_history,0.004371343447374591,forest NO_LOAD depth=8,first look only

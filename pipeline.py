@@ -17,14 +17,16 @@
 
 import os
 import sys
+import warnings
 import zlib
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Lasso, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -84,23 +86,17 @@ CANCELLED_RACES = [
     "BT2223SWRLCP09SWPU",
 ]
 
-# Step 4, the ridge model. Alpha says how strongly the weights are pulled
-# towards 0. These rules were fixed BEFORE looking at any result:
-# - try every alpha of the grid,
-# - take the alpha with the lowest mean validation MAE over the 5 folds,
-# - tie rule: round the mean MAE to 3 decimals; among the alphas that share
-#   the best rounded value, take the largest (the simplest model),
-# - edge rule: if the chosen alpha is the smallest or the largest of the
-#   grid, add 2 more steps of 10 on that side and choose again. Only once.
-ALPHA_GRID = [0.01, 0.1, 1, 10, 100, 1000]
-MAE_DECIMALS = 3        # the rounding of the tie rule
-EDGE_STEPS = 2          # how many steps of 10 the edge rule adds
+# Step 4, the linear models. Alpha says how strongly the weights are pulled
+# towards 0. Step 4 scores every alpha of the grids and chooses nothing.
+ALPHA_GRID = [0.01, 0.1, 1, 10, 100, 1000]                # ridge
+LASSO_ALPHAS = [0.00001, 0.0001, 0.001, 0.01, 0.1]       # lasso
+LASSO_MAX_ITER = 10000      # how many rounds the lasso may use to find its weights
 
 # The value the simple models predict when they know nothing: the middle.
 MIDDLE = 0.5
 
-# The 5 scores of step 4, in the order of the tables.
-SCORES = ["mae", "rmse", "r2", "spearman", "top10"]
+# The 5 scores, in the order of the tables. list_mae is the primary metric.
+SCORES = ["list_mae", "list_rmse", "list_r2", "spearman", "top10"]
 
 # The 13 features. Changed on 17 Nov: feature 4 and 6 have a new rule,
 # 8 and 9 are new (they replace "days since the last sprint" and "days since
@@ -123,19 +119,18 @@ FEATURES = [
 ]
 
 
-# Step 5: 2 model families on 2 input sets. All rules were fixed BEFORE
-# looking at any result.
-# The 4 load features: how much and how recently the athlete raced.
-LOAD_FEATURES = ["days_since_race", "race_days_21d",
-                 "missed_prev_event", "first_start_major"]
-# FULL = all 13 inputs. NO_LOAD = FULL without the 4 load features (9 inputs).
+# Step 5: 4 model families on 2 input sets. All rules were written down
+# BEFORE looking at any step 5 result.
+# The 3 load features: how much and how recently the athlete raced.
+LOAD_FEATURES = ["race_days_21d", "missed_prev_event", "first_start_major"]
+# FULL = all 13 inputs ("with load"). NO_LOAD = without the 3 load features (10 inputs).
 INPUT_SETS = {
     "FULL": FEATURES,
     "NO_LOAD": [name for name in FEATURES if name not in LOAD_FEATURES],
 }
 
 # The random forest: 300 trees, each split looks at a third of the inputs,
-# a leaf may hold 1 single row, and the seed makes every run the same.
+# a leaf may hold 1 single row (the default), and the seed makes every run the same.
 FOREST_TREES = 300
 FOREST_MAX_FEATURES = 1 / 3
 FOREST_MIN_LEAF = 1
@@ -144,23 +139,40 @@ FOREST_SEED = 42
 # until the end. It is written as infinity, so that it sorts as the deepest.
 NO_LIMIT = np.inf
 DEPTH_GRID = [2, 4, 6, 8, 12, 16, NO_LIMIT]
-# Completing the grid: around the best depth, the 2 depths halfway to its
-# neighbours are added. Once, no second round.
+# Refinement round, once: around the best depth, the 2 depths halfway to its
+# neighbours in the grid are added.
 EXTRA_DEPTHS = {2: [1, 3], 4: [3, 5], 6: [5, 7], 8: [7, 10],
                 12: [10, 14], 16: [14, 20], NO_LIMIT: [20, 24]}
-# Edge rule of step 5: if the final choice is ridge with the largest alpha
-# of the grid, these 2 alphas are added for both input sets. Once.
-EDGE_ALPHAS = [10000, 100000]
+
+# Gradient boosting (HistGradientBoostingRegressor): at most 2000 trees with
+# early stopping, the seed 42, and the grid of the course (L12).
+BOOST_MAX_ITER = 2000
+BOOST_SEED = 42
+BOOST_RATES = [0.02, 0.05, 0.1, 0.2]
+BOOST_DEPTHS = [3, 4, 6]
+
+# The selection rule (one standard error rule), step 4 of the rule: among the
+# eligible candidates the simplest wins. Family order: linear before trees,
+# ridge before lasso, forest before boosting.
+FAMILY_ORDER = {"ridge": 1, "lasso": 2, "forest": 3, "boosting": 4}
+# Grid edge: if the choice is at the edge of the ridge or lasso grid, that
+# grid is extended by 2 steps of 10 beyond the edge, once.
+EDGE_STEPS = 2
 
 # Step 6, part A: the robustness run. Each validation season is predicted
 # from the WINDOW_SEASONS seasons just before it only (a sliding window),
 # and not from all earlier seasons as in step 5.
 WINDOW_SEASONS = 5
 
-# Step 6, part B: the final test. The final model was chosen in step 5 and
-# is frozen: ridge, the NO_LOAD inputs (9), alpha 1000.
-FINAL_INPUTS = "NO_LOAD"
-FINAL_ALPHA = 1000
+# Step 6: the final test. The final model chosen in step 5 (18 Nov),
+# written here by hand after "python pipeline.py models". Frozen: nothing
+# here may change after the test numbers have been seen.
+FINAL_FAMILY = "lasso"           # chosen by the one standard error rule
+FINAL_INPUTS = "NO_LOAD"         # 10 inputs, without the 3 load features
+FINAL_VALUE = 0.01               # alpha of the lasso
+# load_test_rows refuses to read the test seasons while this is False.
+# Set to True by hand on 18 Nov, after the go of the project owner.
+TEST_UNLOCKED = True
 # What we expect to load. If a count is different, the command stops
 # before any test score is computed.
 EXPECTED_TRAIN_ROWS = 18183
@@ -172,24 +184,29 @@ STORY_FIGURE = "test_story.png"
 # Permutation importance: how often each column is shuffled, and the seed.
 PERM_REPEATS = 20
 PERM_SEED = 42
-# The groups of inputs that are shuffled together.
+# The groups of inputs that are shuffled together. Together they hold each
+# of the 10 NO_LOAD inputs exactly once.
 INPUT_GROUPS = {
     "results": ["last3_finish_pct", "last_finish_pct", "last_place_any"],
     "skiing": ["last3_ski_pct"],
-    "shooting": ["last3_range_pct", "last3_misses"],
-    "experience and timing": ["n_prev_sprints", "days_since_sprint", "no_history"],
+    "shooting": ["last3_range_pct", "last3_miss_pct", "window_mean_misses", "window_miss_dispersion"],
+    "experience": ["n_sprints_window", "no_history"],
 }
 # The limits of the slices.
 PCT_FRONT = 0.10        # real finish percentile up to here = the front of the race
 PCT_BACK = 0.90         # from here on = the back of the race
-DAYS_SHORT = 30         # days since the last sprint: up to 30, 31 to 180, above 180
-DAYS_LONG = 180
-STORY_NUMBER = 24       # the story race: number 24 of the 48 races sorted by MAE
+SPRINTS_FEW = 3         # n_sprints_window: 0 to 3, 4 to 9, 10 or more
+SPRINTS_MANY = 10
+# The story race: number 24 of the 48 races sorted by list MAE. 48 is even,
+# so there are 2 middle races (24 and 25); we take the lower one.
+STORY_NUMBER = 24
 # The 3 models that are scored on the test seasons, and their column of predictions.
 TEST_MODELS = {"final": "pred_final", "constant": "pred_constant", "naive": "pred_naive"}
+# The slices look at these 2 models only.
+SLICE_MODELS = ["final", "naive"]
 
-# The learning curve: the shares of the training rows, and the seed that
-# picks the random subset.
+# The learning curve: the shares of the training RACES, and the seed that
+# picks the random subset of whole races.
 CURVE_SHARES = [0.2, 0.4, 0.6, 0.8, 1.0]
 CURVE_SEED = 42
 
@@ -545,29 +562,58 @@ def make_folds(df):
 
 
 # ------------------------------------------------------------------ metrics
-# Each metric gets the rows of some races (with race_id and the true finish
-# percentile) and 1 prediction per row, in the same order.
+# Each metric gets the rows of some WHOLE races (with race_id and the true
+# finish percentile) and 1 prediction per row, in the same order.
+#
+# The primary metric is the LIST MAE. The model is used to make a predicted
+# result list, so we score the list and not the predicted values:
+# 1. in each race, sort the predictions from low to high and give each
+#    athlete a predicted place 1, 2, ..., n (n = finishers in the race),
+# 2. turn the place into a predicted percentile with the formula of the
+#    target: (place - 1) / (n - 1),
+# 3. compare this predicted percentile with the real finish percentile.
+# RMSE and R2 are computed on the same predicted percentile.
+# The raw MAE, RMSE and R2 on the predicted values were removed on 18 Nov.
 
-def mae(rows, pred):
-    """Mean absolute error: the mean distance between prediction and truth.
-    This is the primary metric, used for all choices."""
-    return np.mean(np.abs(np.asarray(pred) - rows[TARGET].to_numpy()))
+def list_percentile(rows, pred):
+    """The predicted result list, written as a percentile: 0 for the athlete
+    predicted first in the race, 1 for the one predicted last.
+    Equal predictions: the rows of the race are first mixed in a random order
+    with the seed of the race (the same as in top_n_hit_rate), then sorted.
+    The sort is "stable": equal predictions keep the mixed order."""
+    table = pd.DataFrame({"race_id": rows["race_id"].to_numpy(),
+                          "pred": np.asarray(pred, dtype=float)})
+    pct = np.zeros(len(table))
+    for race_id, race in table.groupby("race_id"):
+        seed = zlib.crc32(race_id.encode())             # the seed of the race
+        race = race.sample(frac=1, random_state=seed)   # mix the rows
+        race = race.sort_values("pred", kind="stable")  # lowest prediction first
+        place = np.arange(1, len(race) + 1)             # predicted place 1 to n
+        pct[race.index] = (place - 1) / (len(race) - 1)
+    return pct
 
 
-def rmse(rows, pred):
-    """Root mean squared error: like the MAE, but big errors count more,
-    because every error is squared before the mean is taken."""
-    errors = np.asarray(pred) - rows[TARGET].to_numpy()
+def list_mae(rows, pred):
+    """List MAE, the primary metric: the mean distance between the predicted
+    percentile from the list and the real finish percentile.
+    0 = the list is the real result. A random list gives about 1/3."""
+    return np.mean(np.abs(list_percentile(rows, pred) - rows[TARGET].to_numpy()))
+
+
+def list_rmse(rows, pred):
+    """Like the list MAE, but big errors count more: every error is squared
+    before the mean is taken, and the square root is taken at the end."""
+    errors = list_percentile(rows, pred) - rows[TARGET].to_numpy()
     return np.sqrt(np.mean(errors ** 2))
 
 
-def r2(rows, pred):
-    """R2: the share of the spread of the truth that the prediction explains.
-    1 = perfect. 0 = as good as predicting the mean of the truth for all.
-    Below 0 = worse than that."""
+def list_r2(rows, pred):
+    """R2 of the predicted percentile from the list. 1 = perfect.
+    0 = as good as predicting the mean of the truth for all. A random list
+    gives about -1: its squared errors are about twice the spread of the truth."""
     true = rows[TARGET].to_numpy()
-    left_over = np.sum((true - np.asarray(pred)) ** 2)     # squared errors of the model
-    spread = np.sum((true - true.mean()) ** 2)             # squared errors of "always the mean"
+    left_over = np.sum((true - list_percentile(rows, pred)) ** 2)   # squared errors of the list
+    spread = np.sum((true - true.mean()) ** 2)                      # squared errors of "always the mean"
     return 1 - left_over / spread
 
 
@@ -616,10 +662,10 @@ def top_n_hit_rate(rows, pred):
 
 
 def all_metrics(rows, pred):
-    """The 5 metrics together, as a small dictionary."""
-    return {"mae": mae(rows, pred),
-            "rmse": rmse(rows, pred),
-            "r2": r2(rows, pred),
+    """The 5 metrics together, as a small dictionary. list_mae is the primary one."""
+    return {"list_mae": list_mae(rows, pred),
+            "list_rmse": list_rmse(rows, pred),
+            "list_r2": list_r2(rows, pred),
             "spearman": mean_spearman(rows, pred),
             "top10": top_n_hit_rate(rows, pred)}
 
@@ -648,17 +694,23 @@ def show_split():
 
 
 # ------------------------------------------------------------------ baselines
-# Step 4: 3 simple models, scored on the 5 walk forward folds.
+# Step 4: the ladder of simple models (constant, naive rule, ridge, lasso),
+# scored with the list metrics on the 5 walk forward folds. Every number a
+# model learns comes from the training part of the fold. No alpha is chosen.
 
-def predict_constant(rows):
-    """Model 1: the same value, 0.5, for everybody. It knows nothing."""
-    return np.full(len(rows), MIDDLE)
+def predict_constant(rows, value=MIDDLE):
+    """Model 1: the same value for everybody. In step 4 the value is the mean
+    of the target in the training part of the fold. All predictions tie, so
+    the list comes from the seed of each race: a random order."""
+    return np.full(len(rows), value)
 
 
-def predict_naive(rows):
-    """Model 2: the mean finish percentile of the last 3 sprints, as it is.
-    Where this value is empty (no previous sprint), 0.5. Nothing is learned."""
-    return rows["last3_finish_pct"].fillna(MIDDLE).to_numpy()
+def predict_naive(rows, fill=MIDDLE):
+    """Model 2: sort by the mean finish percentile of the last 3 sprints.
+    Where it is empty (no previous sprint), the value 'fill' is used. In
+    step 4 'fill' is the median of this column in the training part of the
+    fold. Nothing else is learned."""
+    return rows["last3_finish_pct"].fillna(fill).to_numpy()
 
 
 def make_ridge(alpha):
@@ -673,207 +725,172 @@ def make_ridge(alpha):
                      ("ridge", Ridge(alpha=alpha))])
 
 
+def make_lasso(alpha):
+    """Model 4: the same 3 steps, with a lasso at the end. A lasso also pulls
+    the weights towards 0, but it can set a weight exactly to 0: the input
+    is then dropped from the model."""
+    return Pipeline([("fill", SimpleImputer(strategy="median")),
+                     ("scale", StandardScaler()),
+                     ("lasso", Lasso(alpha=alpha, max_iter=LASSO_MAX_ITER))])
+
+
+def history_list_mae(rows, pred):
+    """The list MAE of the rows without and with a previous sprint. The list
+    is made on the WHOLE race first, then the rows are split."""
+    errors = np.abs(list_percentile(rows, pred) - rows[TARGET].to_numpy())
+    new = (rows["no_history"] == 1).to_numpy()
+    return {"n_no_history": int(new.sum()),
+            "list_mae_no_history": errors[new].mean() if new.any() else np.nan,
+            "list_mae_with_history": errors[~new].mean()}
+
+
 def score_line(model, alpha, fold, val_season, part, rows, pred):
-    """1 line of the score table: who was scored, on which rows, and the 5 scores."""
+    """1 line of the score table: who was scored, on which rows, and the scores."""
     line = {"model": model, "alpha": alpha, "fold": fold,
             "val_season": val_season, "part": part, "n_rows": len(rows)}
     line.update(all_metrics(rows, pred))
-    # The MAE again, separately for the rows without and with a previous sprint.
-    pred = np.asarray(pred)
-    new = (rows["no_history"] == 1).to_numpy()
-    line["n_no_history"] = int(new.sum())
-    line["mae_no_history"] = mae(rows[new], pred[new])
-    line["mae_with_history"] = mae(rows[~new], pred[~new])
+    line.update(history_list_mae(rows, pred))
     return line
 
 
-def score_models(alphas, with_simple=True):
-    """Score the models on the training part and the validation part of each
-    fold. Returns 1 long table with 1 line per model, alpha, fold and part.
-    with_simple=False scores only the ridge models (used by the edge rule)."""
+def score_baselines():
+    """Fit and score every candidate in every fold. Returns 3 tables:
+    the scores, the weights of the linear models, and 1 line per linear
+    model and fold with its number of nonzero weights and its warnings."""
     df = load_features()            # the test seasons are already removed here
-    lines = []
+    scores = []
+    weights = []
+    linear = []
     fold = 0
     for val_season, train_part, val_part in make_folds(df):
         fold = fold + 1
         parts = [("train", train_part), ("validation", val_part)]
 
-        if with_simple:
-            for part, rows in parts:
-                lines.append(score_line("constant", np.nan, fold, val_season,
-                                        part, rows, predict_constant(rows)))
-                lines.append(score_line("naive", np.nan, fold, val_season,
-                                        part, rows, predict_naive(rows)))
+        # 1. Constant: the mean of the target in the training part.
+        mean = train_part[TARGET].mean()
+        for part, rows in parts:
+            scores.append(score_line("constant", np.nan, fold, val_season, part, rows,
+                                     predict_constant(rows, mean)))
 
-        for alpha in alphas:
-            model = make_ridge(alpha)
-            # fit sees the training part of this fold only. The medians, the
-            # scaling and the weights all come from these rows.
-            model.fit(train_part[FEATURES], train_part[TARGET])
-            for part, rows in parts:
-                pred = model.predict(rows[FEATURES])
-                lines.append(score_line("ridge", alpha, fold, val_season,
-                                        part, rows, pred))
-    return pd.DataFrame(lines)
+        # 2. Naive rule: empty values get the median of the training part.
+        fill = train_part["last3_finish_pct"].median()
+        for part, rows in parts:
+            scores.append(score_line("naive", np.nan, fold, val_season, part, rows,
+                                     predict_naive(rows, fill)))
 
-
-def alpha_table(scores):
-    """Mean MAE of the ridge model for each alpha, on train and on validation."""
-    ridge = scores[scores["model"] == "ridge"]
-    table = ridge.pivot_table(index="alpha", columns="part", values="mae", aggfunc="mean")
-    table = table.rename(columns={"train": "train_mae", "validation": "val_mae"})
-    table["val_mae_rounded"] = table["val_mae"].round(MAE_DECIMALS)
-    return table.sort_index().reset_index()
-
-
-def choose_alpha(table):
-    """Apply the choice rule and the tie rule to an alpha table.
-    Returns the chosen alpha and the alphas that share the best rounded MAE."""
-    best = table["val_mae_rounded"].min()
-    tied = table[table["val_mae_rounded"] == best]["alpha"].tolist()
-    return max(tied), tied          # the tie rule: the largest of them
-
-
-def find_alpha():
-    """Score all models and choose the alpha, with the rules fixed in advance.
-    Returns the score table, the alpha table and the chosen alpha."""
-    scores = score_models(ALPHA_GRID)
-    scores["round"] = "grid"                    # scored in the first round
-    table = alpha_table(scores)
-    alpha, tied = choose_alpha(table)
-    first_choice = alpha
-    edge_rule = "not used"
-
-    # Edge rule: the chosen alpha sits at an end of the grid, so the best
-    # value could lie outside. Add 2 steps of 10 on that side, choose again.
-    if alpha == max(ALPHA_GRID) or alpha == min(ALPHA_GRID):
-        if alpha == max(ALPHA_GRID):
-            extra = [alpha * 10 ** step for step in range(1, EDGE_STEPS + 1)]
-            edge_rule = "used at the largest alpha"
-        else:
-            extra = [alpha / 10 ** step for step in range(1, EDGE_STEPS + 1)]
-            edge_rule = "used at the smallest alpha"
-        more = score_models(extra, with_simple=False)
-        more["round"] = "edge rule"
-        scores = pd.concat([scores, more], ignore_index=True)
-        table = alpha_table(scores)
-        alpha, tied = choose_alpha(table)       # choose again, only this once
-
-    # Write down how the choice was made, next to the numbers.
-    table["first_grid"] = table["alpha"].isin(ALPHA_GRID)
-    table["chosen"] = table["alpha"] == alpha
-    table["shares_best_rounded_mae"] = table["alpha"].isin(tied)
-    table["tie_rule"] = "used" if len(tied) > 1 else "not used"
-    table["edge_rule"] = edge_rule
-    table["first_choice"] = first_choice
-    return scores, table, alpha
+        # 3. and 4. Ridge and lasso at every alpha of their grid.
+        for family, make, alphas in [("ridge", make_ridge, ALPHA_GRID),
+                                     ("lasso", make_lasso, LASSO_ALPHAS)]:
+            for alpha in alphas:
+                model = make(alpha)
+                # Catch the warnings of fit, so that we can count them. A
+                # ConvergenceWarning means the lasso stopped after max_iter
+                # rounds before its weights had settled.
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    model.fit(train_part[FEATURES], train_part[TARGET])   # training part only
+                coef = model.steps[-1][1].coef_          # 1 weight per input, on the scaled inputs
+                for name, weight in zip(FEATURES, coef):
+                    weights.append({"model": family, "alpha": alpha, "fold": fold,
+                                    "val_season": val_season, "feature": name, "weight": weight})
+                linear.append({"model": family, "alpha": alpha, "fold": fold, "val_season": val_season,
+                               "nonzero": int((coef != 0).sum()),
+                               "dropped": ", ".join(n for n, w in zip(FEATURES, coef) if w == 0),
+                               "convergence_warnings": sum(issubclass(w.category, ConvergenceWarning) for w in caught),
+                               "other_warnings": sum(not issubclass(w.category, ConvergenceWarning) for w in caught)})
+                for part, rows in parts:
+                    scores.append(score_line(family, alpha, fold, val_season, part, rows,
+                                             model.predict(rows[FEATURES])))
+        print("  fold", fold, "of", len(VALIDATION_SEASONS), "done")
+    return pd.DataFrame(scores), pd.DataFrame(weights), pd.DataFrame(linear)
 
 
 def summary_table(scores):
-    """Mean and standard deviation over the 5 folds, for every model, alpha
-    and part. The standard deviation is the usual one (divided by 5 - 1)."""
-    keys = ["model", "alpha", "part"]
-    numbers = SCORES + ["mae_no_history", "mae_with_history"]
-    # dropna=False keeps the constant and the naive model, which have no alpha.
-    table = scores.groupby(keys, dropna=False)[numbers].agg(["mean", "std"])
+    """Mean and standard deviation over the 5 folds, for every candidate and
+    part. The standard deviation is the sample one (ddof = 1)."""
+    numbers = SCORES + ["list_mae_no_history", "list_mae_with_history"]
+    # dropna=False keeps the constant and the naive rule, which have no alpha.
+    table = scores.groupby(["model", "alpha", "part"], dropna=False)[numbers].agg(["mean", "std"])
     table.columns = [score + "_" + what for score, what in table.columns]
-    return table.reset_index()
+    table = table.reset_index()
+    order = {"constant": 1, "naive": 2, "ridge": 3, "lasso": 4}
+    table["order"] = table["model"].map(order)
+    table = table.sort_values(["order", "alpha", "part"]).drop(columns="order")
+    return table.reset_index(drop=True)
 
 
-def ladder_table(summary, alpha):
-    """The 3 models next to each other: constant, naive, ridge at the chosen alpha."""
-    keep = (summary["model"] != "ridge") | (summary["alpha"] == alpha)
-    ladder = summary[keep].copy()
-    # Put the lines in the order of the ladder: constant, naive, ridge.
-    order = {"constant": 1, "naive": 2, "ridge": 3}
-    ladder["order"] = ladder["model"].map(order)
-    ladder = ladder.sort_values(["order", "part"]).drop(columns="order")
+def ladder_table(summary):
+    """The ladder: every candidate, the 5 scores, mean and std, train and validation."""
     columns = ["model", "alpha", "part"] + [s + "_" + w for s in SCORES for w in ["mean", "std"]]
-    return ladder[columns].reset_index(drop=True)
+    return summary[columns]
 
 
-def history_table(summary, alpha):
-    """Validation MAE of the 3 models for the rows without and with history."""
-    ladder = summary[(summary["model"] != "ridge") | (summary["alpha"] == alpha)]
-    val = ladder[ladder["part"] == "validation"]
-    order = {"constant": 1, "naive": 2, "ridge": 3}
-    val = val.sort_values("model", key=lambda col: col.map(order))
-    return val[["model", "alpha", "mae_mean", "mae_std",
-                "mae_no_history_mean", "mae_no_history_std",
-                "mae_with_history_mean", "mae_with_history_std"]].reset_index(drop=True)
-
-
-def weights_table(alpha):
-    """Fit the ridge model on ALL training seasons and list its weights.
-    The inputs were scaled, so the weights can be compared with each other:
-    a weight says how much the prediction moves when the feature goes up by
-    1 standard deviation."""
-    df = load_features()
-    train = df[df["season"].isin(TRAIN_SEASONS)]
-    model = make_ridge(alpha)
-    model.fit(train[FEATURES], train[TARGET])
-    table = pd.DataFrame({"feature": FEATURES,
-                          "weight": model.named_steps["ridge"].coef_,
-                          "fill_median": model.named_steps["fill"].statistics_})
-    table["size"] = table["weight"].abs()
-    table = table.sort_values("size", ascending=False).reset_index(drop=True)
-    table["alpha"] = alpha
-    table["intercept"] = model.named_steps["ridge"].intercept_
+def alpha_table(summary):
+    """Mean list MAE of ridge and lasso for each alpha, on train and on validation."""
+    linear = summary[summary["model"].isin(["ridge", "lasso"])]
+    table = linear.pivot_table(index=["model", "alpha"], columns="part",
+                               values="list_mae_mean").reset_index()
+    table = table.rename(columns={"train": "train_list_mae", "validation": "val_list_mae"})
+    table["gap_val_minus_train"] = table["val_list_mae"] - table["train_list_mae"]
     return table
 
 
+def history_table(summary):
+    """Validation list MAE of every candidate for the rows without and with history."""
+    val = summary[summary["part"] == "validation"]
+    return val[["model", "alpha", "list_mae_mean", "list_mae_std",
+                "list_mae_no_history_mean", "list_mae_no_history_std",
+                "list_mae_with_history_mean", "list_mae_with_history_std"]].reset_index(drop=True)
+
+
 def load_output(name):
-    """Load 1 of the tables that 'python pipeline.py baselines' saved in outputs/."""
+    """Load 1 of the tables that the commands saved in outputs/."""
     return pd.read_csv(os.path.join(OUTPUT_DIR, name + ".csv"), dtype={"val_season": str})
 
 
 def run_baselines():
-    """The whole step 4: score, choose the alpha, save the tables, print."""
-    scores, alphas, alpha = find_alpha()
+    """The whole step 4: score, save the tables, print. Nothing is chosen."""
+    scores, weights, linear = score_baselines()
     summary = summary_table(scores)
-    ladder = ladder_table(summary, alpha)
-    history = history_table(summary, alpha)
-    weights = weights_table(alpha)
+    ladder = ladder_table(summary)
+    alphas = alpha_table(summary)
+    history = history_table(summary)
 
-    # Save every table as a file.
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    tables = {"baselines_scores_per_fold": scores,
-              "baselines_summary": summary,
-              "baselines_alpha": alphas,
-              "baselines_ladder": ladder,
-              "baselines_history": history,
-              "baselines_weights": weights}
+    tables = {"baselines_scores_per_fold": scores, "baselines_summary": summary,
+              "baselines_ladder": ladder, "baselines_alpha": alphas,
+              "baselines_history": history, "baselines_weights": weights,
+              "baselines_linear": linear}
     for name, table in tables.items():
         table.to_csv(os.path.join(OUTPUT_DIR, name + ".csv"), index=False)
 
-    print("--- alpha: mean MAE over the 5 folds ---")
-    print(alphas[["alpha", "train_mae", "val_mae", "val_mae_rounded", "first_grid", "chosen"]]
-          .round(5).to_string(index=False))
-    print("chosen alpha:", alpha, "  tie rule:", alphas["tie_rule"].iloc[0],
-          "  edge rule:", alphas["edge_rule"].iloc[0])
-
-    print("\n--- the ladder: mean and standard deviation over the 5 folds ---")
-    print(ladder.round(3).to_string(index=False))
-
-    print("\n--- validation MAE, rows without and with history ---")
-    print(history.round(3).to_string(index=False))
-
-    print("\n--- ridge weights at the chosen alpha, fitted on all training seasons ---")
-    print(weights[["feature", "weight"]].round(4).to_string(index=False))
-
+    val = ladder[ladder["part"] == "validation"]
+    print("\n--- validation, mean and std over the 5 folds ---")
+    print(val[["model", "alpha"] + [s + "_" + w for s in SCORES for w in ["mean", "std"]]]
+          .round(4).to_string(index=False))
+    print("\n--- ridge and lasso: mean list MAE by alpha ---")
+    print(alphas.round(5).to_string(index=False))
+    print("\n--- validation list MAE, rows without and with history ---")
+    print(history.round(4).to_string(index=False))
+    print("\n--- lasso: nonzero weights per fold, warnings ---")
+    lasso = linear[linear["model"] == "lasso"]
+    print(lasso.pivot(index="alpha", columns="fold", values="nonzero").to_string())
+    print("convergence warnings, all fits:", int(linear["convergence_warnings"].sum()),
+          "  other warnings:", int(linear["other_warnings"].sum()))
     print("\nsaved in " + OUTPUT_DIR + "/:", ", ".join(name + ".csv" for name in tables))
 
 
 # ------------------------------------------------------------------ models
-# Step 5: ridge and random forest on 2 input sets, and the final choice.
-# A "candidate" is 1 model family + 1 input set + 1 value of its setting
-# (alpha for ridge, depth for the forest).
+# Step 5: 4 model families (ridge, lasso, random forest, gradient boosting)
+# on 2 input sets, scored with the list metrics on the 5 walk forward folds,
+# and the final choice. A "candidate" is 1 family + 1 input set + 1 setting:
+# alpha (ridge, lasso), depth (forest), learning rate and depth (boosting).
+# The selection rule was written down before any step 5 result was seen.
 
 def make_forest(depth):
     """The random forest pipeline: median fill, then the forest. No scaler:
     a tree only asks "is the value above or below a limit", so the scale of
-    an input does not matter. n_jobs=-1 only uses all processor cores, the
-    result is the same."""
+    an input does not matter. n_jobs=-1 only uses all processor cores."""
     if depth == NO_LIMIT:
         max_depth = None                 # how scikit-learn writes "no limit"
     else:
@@ -887,48 +904,72 @@ def make_forest(depth):
                                                       n_jobs=-1))])
 
 
-def make_model(family, value):
-    """Build the pipeline of a candidate: ridge with this alpha, or forest with this depth."""
+def make_boosting(learning_rate, depth):
+    """Gradient boosting: trees are added one after the other, each one
+    corrects the errors of the trees before it, scaled down by the learning
+    rate. No fill and no scaler: this model handles empty values itself.
+    Early stopping: 10 % of the training rows are kept apart, and adding
+    trees stops when they no longer help on these rows (at most 2000)."""
+    return HistGradientBoostingRegressor(max_iter=BOOST_MAX_ITER, early_stopping=True,
+                                         learning_rate=learning_rate, max_depth=int(depth),
+                                         random_state=BOOST_SEED)
+
+
+def make_model(family, value, learning_rate=np.nan):
+    """Build the model of a candidate."""
     if family == "ridge":
         return make_ridge(value)
-    return make_forest(value)
+    if family == "lasso":
+        return make_lasso(value)
+    if family == "forest":
+        return make_forest(value)
+    return make_boosting(learning_rate, value)
 
 
-def candidate_name(family, inputs, value):
-    """A short name for printing, like 'ridge NO_LOAD alpha=10' or 'forest FULL depth=8'."""
-    if family == "ridge":
-        return "ridge " + inputs + " alpha=" + format(value, "g")
-    if value == NO_LIMIT:
-        return "forest " + inputs + " depth=None"
-    return "forest " + inputs + " depth=" + str(int(value))
+def candidate_name(family, inputs, value, learning_rate=np.nan):
+    """A short name, like 'ridge NO_LOAD alpha=10' or 'boosting FULL lr=0.05 depth=4'."""
+    if family in ["ridge", "lasso"]:
+        return family + " " + inputs + " alpha=" + format(value, "g")
+    if family == "forest":
+        return "forest " + inputs + " depth=" + ("None" if value == NO_LIMIT else str(int(value)))
+    return "boosting " + inputs + " lr=" + format(learning_rate, "g") + " depth=" + str(int(value))
 
 
 def score_candidates(candidates, folds_function=make_folds):
-    """Score a list of candidates (family, inputs, value) on the training part
-    and the validation part of each fold. 1 line per candidate, fold and part.
-    folds_function builds the folds: the walk forward folds of step 3, or the
-    sliding window folds of the robustness run."""
+    """Fit and score a list of candidates (family, inputs, value, learning_rate)
+    on the training part and the validation part of each fold.
+    1 line per candidate, fold and part."""
     df = load_features()            # the test seasons are already removed here
     lines = []
     fold = 0
     for val_season, train_part, val_part in folds_function(df):
         fold = fold + 1
-        for family, inputs, value in candidates:
+        for family, inputs, value, learning_rate in candidates:
             columns = INPUT_SETS[inputs]
-            model = make_model(family, value)
-            # fit sees the training part of this fold only.
-            model.fit(train_part[columns], train_part[TARGET])
+            model = make_model(family, value, learning_rate)
+            # fit sees the training part of this fold only. The warnings are
+            # caught, so that we can count them.
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                model.fit(train_part[columns], train_part[TARGET])
+            info = {"family": family, "inputs": inputs, "value": value,
+                    "learning_rate": learning_rate,
+                    "name": candidate_name(family, inputs, value, learning_rate),
+                    "n_inputs": len(columns), "fold": fold, "val_season": val_season,
+                    "nonzero": np.nan, "trees_used": np.nan,
+                    "convergence_warnings": sum(issubclass(w.category, ConvergenceWarning) for w in caught),
+                    "other_warnings": sum(not issubclass(w.category, ConvergenceWarning) for w in caught)}
+            if family == "lasso":
+                info["nonzero"] = int((model.named_steps["lasso"].coef_ != 0).sum())
+            if family == "forest":
+                info["trees_used"] = FOREST_TREES
+            if family == "boosting":
+                info["trees_used"] = model.n_iter_           # trees kept by early stopping
             for part, rows in [("train", train_part), ("validation", val_part)]:
                 pred = model.predict(rows[columns])
-                line = {"family": family, "inputs": inputs, "value": value,
-                        "name": candidate_name(family, inputs, value),
-                        "fold": fold, "val_season": val_season,
-                        "part": part, "n_rows": len(rows)}
+                line = dict(info, part=part, n_rows=len(rows))
                 line.update(all_metrics(rows, pred))
-                # The MAE again, for the rows without and with a previous sprint.
-                new = (rows["no_history"] == 1).to_numpy()
-                line["mae_no_history"] = mae(rows[new], pred[new])
-                line["mae_with_history"] = mae(rows[~new], pred[~new])
+                line.update(history_list_mae(rows, pred))
                 lines.append(line)
         print("  fold", fold, "of", len(VALIDATION_SEASONS), "done")
     return pd.DataFrame(lines)
@@ -936,65 +977,96 @@ def score_candidates(candidates, folds_function=make_folds):
 
 def candidate_table(scores):
     """1 line per candidate: mean and standard deviation over the 5 folds of
-    every score, on train and on validation. The standard deviation is the
-    sample one (ddof = 1, divided by 5 - 1). SE = standard deviation / sqrt(5)."""
-    keys = ["family", "inputs", "value", "name"]
-    numbers = SCORES + ["mae_no_history", "mae_with_history"]
+    every score, on train and on validation (sample std, ddof = 1).
+    SE = standard deviation of the 5 validation list MAEs / sqrt(5)."""
+    keys = ["family", "inputs", "value", "learning_rate", "name", "n_inputs"]
+    numbers = SCORES + ["list_mae_no_history", "list_mae_with_history"]
     parts = []
     for part, short in [("validation", "val"), ("train", "train")]:
         rows = scores[scores["part"] == part]
-        table = rows.groupby(keys)[numbers].agg(["mean", "std"])     # std: ddof = 1
+        table = rows.groupby(keys, dropna=False)[numbers].agg(["mean", "std"])
         table.columns = [short + "_" + score + "_" + what for score, what in table.columns]
         parts.append(table)
     table = pd.concat(parts, axis=1).reset_index()
+    val = scores[scores["part"] == "validation"]
+    extra = val.groupby("name").agg(max_nonzero=("nonzero", "max"), trees_used_mean=("trees_used", "mean"),
+                                    convergence_warnings=("convergence_warnings", "sum"),
+                                    other_warnings=("other_warnings", "sum"))
+    table = table.merge(extra.reset_index(), on="name")
     n_folds = scores["fold"].nunique()
-    table["val_mae_se"] = table["val_mae_std"] / np.sqrt(n_folds)
-    return table.sort_values("val_mae_mean").reset_index(drop=True)
+    table["val_list_mae_se"] = table["val_list_mae_std"] / np.sqrt(n_folds)
+    table["gap_val_minus_train"] = table["val_list_mae_mean"] - table["train_list_mae_mean"]
+    # The number of inputs of the simplicity rule: for lasso the largest
+    # number of nonzero weights over the 5 folds, for the others the input set.
+    table["simplicity_inputs"] = np.where(table["family"] == "lasso", table["max_nonzero"], table["n_inputs"])
+    table = table.sort_values("val_list_mae_mean").reset_index(drop=True)
+    table["raw_rank"] = table.index + 1                       # 1 = lowest mean validation list MAE
+    return table
 
 
 def simplest_first(table):
     """Sort candidates from the simplest to the most complex:
-    a) NO_LOAD before FULL, b) ridge before forest,
-    c) ridge: the larger alpha first; forest: the smaller depth first."""
+    a) fewer inputs (lasso: the largest number of nonzero weights over the folds),
+    b) ridge, lasso, forest, boosting,
+    c) ridge and lasso: larger alpha first; forest: smaller depth first;
+       boosting: smaller depth first, then fewer trees used (mean over folds)."""
     table = table.copy()
-    table["key_inputs"] = (table["inputs"] != "NO_LOAD").astype(int)     # NO_LOAD = 0, FULL = 1
-    table["key_family"] = (table["family"] != "ridge").astype(int)       # ridge = 0, forest = 1
-    # For ridge a LARGER alpha is simpler, so we turn the sign around.
-    table["key_value"] = np.where(table["family"] == "ridge", -table["value"], table["value"])
-    table = table.sort_values(["key_inputs", "key_family", "key_value"])
-    return table.drop(columns=["key_inputs", "key_family", "key_value"])
+    table["key_family"] = table["family"].map(FAMILY_ORDER)
+    # For ridge and lasso a LARGER alpha is simpler, so we turn the sign around.
+    table["key_value"] = np.where(table["family"].isin(["ridge", "lasso"]), -table["value"], table["value"])
+    table["key_trees"] = np.where(table["family"] == "boosting", table["trees_used_mean"], 0)
+    table = table.sort_values(["simplicity_inputs", "key_family", "key_value", "key_trees"])
+    return table.drop(columns=["key_family", "key_value", "key_trees"])
 
 
 def one_se_rule(table):
-    """The one standard error rule on a table of candidates.
-    Returns a small dictionary with the best candidate, the threshold, the
-    names of the eligible candidates and the chosen (simplest eligible) one."""
-    best = table.loc[table["val_mae_mean"].idxmin()]          # lowest mean validation MAE
-    threshold = best["val_mae_mean"] + best["val_mae_se"]     # best mean + its SE
-    eligible = table[table["val_mae_mean"] <= threshold]
+    """The one standard error rule on a table of candidates."""
+    best = table.loc[table["val_list_mae_mean"].idxmin()]          # lowest mean validation list MAE
+    threshold = best["val_list_mae_mean"] + best["val_list_mae_se"]  # best mean + its SE
+    eligible = table[table["val_list_mae_mean"] <= threshold]
     chosen = simplest_first(eligible).iloc[0]
-    return {"best": best["name"], "best_mean": best["val_mae_mean"],
-            "se": best["val_mae_se"], "threshold": threshold,
-            "eligible": eligible["name"].tolist(), "chosen": chosen["name"]}
+    return {"best": best["name"], "best_mean": best["val_list_mae_mean"],
+            "se": best["val_list_mae_se"], "threshold": threshold,
+            "eligible": simplest_first(eligible)["name"].tolist(), "chosen": chosen["name"],
+            "chosen_mean": chosen["val_list_mae_mean"], "chosen_raw_rank": int(chosen["raw_rank"])}
 
 
-def fold_values(scores, name, column="mae"):
+def grid_edge(line):
+    """Does a candidate sit at the edge of its grid? Returns the extra values
+    for ridge and lasso (2 steps of 10 beyond the edge), None when it is not
+    at an edge, and the word "undefined" for forest and boosting, where the
+    brief does not say how to go beyond the edge."""
+    family, value = line["family"], line["value"]
+    if family in ["ridge", "lasso"]:
+        grid = ALPHA_GRID if family == "ridge" else LASSO_ALPHAS
+        if value == max(grid):
+            return [value * 10 ** step for step in range(1, EDGE_STEPS + 1)]
+        if value == min(grid):
+            return [value / 10 ** step for step in range(1, EDGE_STEPS + 1)]
+        return None
+    if family == "forest":
+        return "undefined" if value in [min(DEPTH_GRID), NO_LIMIT] else None
+    edge_rate = line["learning_rate"] in [min(BOOST_RATES), max(BOOST_RATES)]
+    edge_depth = value in [min(BOOST_DEPTHS), max(BOOST_DEPTHS)]
+    return "undefined" if edge_rate or edge_depth else None
+
+
+def fold_values(scores, name, column="list_mae"):
     """The 5 validation values of 1 candidate, 1 per fold, in fold order."""
     rows = scores[(scores["name"] == name) & (scores["part"] == "validation")]
     return rows.sort_values("fold")[column].to_numpy()
 
 
 def compare(scores, table, name_a, name_b, what):
-    """Put 2 candidates next to each other: the 2 mean validation MAEs, the
-    difference (a minus b) in each fold, its mean and its standard error."""
+    """2 candidates side by side: the 2 mean validation list MAEs, the
+    difference (a minus b) in each fold, its mean and its SE."""
     diff = fold_values(scores, name_a) - fold_values(scores, name_b)
+    by_name = table.set_index("name")
     line = {"comparison": what, "a": name_a, "b": name_b,
-            "a_mean": table.set_index("name").loc[name_a, "val_mae_mean"],
-            "b_mean": table.set_index("name").loc[name_b, "val_mae_mean"],
-            "a_se": table.set_index("name").loc[name_a, "val_mae_se"],
-            "b_se": table.set_index("name").loc[name_b, "val_mae_se"],
+            "a_mean": by_name.loc[name_a, "val_list_mae_mean"],
+            "b_mean": by_name.loc[name_b, "val_list_mae_mean"],
             "diff_mean": diff.mean(),
-            # SE of the difference: sample standard deviation of the 5 fold differences / sqrt(5).
+            # SE of the difference: sample std of the 5 fold differences / sqrt(5).
             "diff_se": diff.std(ddof=1) / np.sqrt(len(diff))}
     for number, value in enumerate(diff):
         line["diff_fold_" + str(number + 1)] = value
@@ -1002,267 +1074,304 @@ def compare(scores, table, name_a, name_b, what):
 
 
 def best_name(table, family=None, inputs=None):
-    """The name of the candidate with the lowest mean validation MAE,
-    inside 1 family and / or 1 input set if they are given."""
+    """The candidate with the lowest mean validation list MAE, inside 1 family
+    and / or 1 input set if they are given."""
     if family is not None:
         table = table[table["family"] == family]
     if inputs is not None:
         table = table[table["inputs"] == inputs]
-    return table.loc[table["val_mae_mean"].idxmin(), "name"]
+    return table.loc[table["val_list_mae_mean"].idxmin(), "name"]
 
 
 def learning_curve(table, names):
     """Train the given candidates on 20, 40, 60, 80 and 100 % of the training
-    rows of each fold and score them on the same validation part."""
+    RACES of each fold (whole races, because a result list needs whole races)
+    and score them on the same validation part."""
     df = load_features()
     lines = []
     fold = 0
     for val_season, train_part, val_part in make_folds(df):
         fold = fold + 1
-        for name in names:
-            cand = table.set_index("name").loc[name]
-            columns = INPUT_SETS[cand["inputs"]]
-            for share in CURVE_SHARES:
-                if share < 1:
-                    # A random subset, always the same one because of the seed.
-                    # sort_index puts the rows back in their original order.
-                    subset = train_part.sample(frac=share, random_state=CURVE_SEED).sort_index()
-                else:
-                    subset = train_part
-                model = make_model(cand["family"], cand["value"])
-                model.fit(subset[columns], subset[TARGET])
-                lines.append({"name": name, "fold": fold, "val_season": val_season,
-                              "share": share, "n_train_rows": len(subset),
-                              "train_mae": mae(subset, model.predict(subset[columns])),
-                              "val_mae": mae(val_part, model.predict(val_part[columns]))})
+        races = pd.Series(train_part["race_id"].unique())
+        for share in CURVE_SHARES:
+            # A random subset of whole races, always the same because of the seed.
+            picked = races.sample(frac=share, random_state=CURVE_SEED)
+            subset = train_part[train_part["race_id"].isin(picked)]
+            for name in names:
+                cand = table.set_index("name").loc[name]
+                columns = INPUT_SETS[cand["inputs"]]
+                model = make_model(cand["family"], cand["value"], cand["learning_rate"])
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    model.fit(subset[columns], subset[TARGET])
+                lines.append({"name": name, "fold": fold, "val_season": val_season, "share": share,
+                              "n_train_races": subset["race_id"].nunique(), "n_train_rows": len(subset),
+                              "train_list_mae": list_mae(subset, model.predict(subset[columns])),
+                              "val_list_mae": list_mae(val_part, model.predict(val_part[columns]))})
     return pd.DataFrame(lines)
 
 
-def importance_table(depth):
-    """Fit the forest with the FULL inputs on all training seasons and list
+def importance_table(name, table):
+    """FIRST LOOK ONLY. Fit the given forest on all training seasons and list
     its feature_importances_ (they add up to 1), sorted."""
+    cand = table.set_index("name").loc[name]
+    columns = INPUT_SETS[cand["inputs"]]
     df = load_features()
     train = df[df["season"].isin(TRAIN_SEASONS)]
-    columns = INPUT_SETS["FULL"]
-    model = make_forest(depth)
+    model = make_forest(cand["value"])
     model.fit(train[columns], train[TARGET])
-    table = pd.DataFrame({"feature": columns,
-                          "importance": model.named_steps["forest"].feature_importances_})
-    table["depth"] = depth
-    return table.sort_values("importance", ascending=False).reset_index(drop=True)
+    out = pd.DataFrame({"feature": columns,
+                        "importance": model.named_steps["forest"].feature_importances_})
+    out["forest"] = name
+    out["label"] = "first look only"
+    return out.sort_values("importance", ascending=False).reset_index(drop=True)
 
 
 def run_models():
     """The whole step 5. Every rule is applied in the order it was written down."""
-    # 1. The 2 families on the 2 input sets, with the grids fixed in advance.
+    # 1. The 4 families on the 2 input sets, with their grids.
     candidates = []
     for inputs in INPUT_SETS:
-        for alpha in ALPHA_GRID:
-            candidates.append(("ridge", inputs, alpha))
-        for depth in DEPTH_GRID:
-            candidates.append(("forest", inputs, depth))
+        candidates += [("ridge", inputs, alpha, np.nan) for alpha in ALPHA_GRID]
+        candidates += [("lasso", inputs, alpha, np.nan) for alpha in LASSO_ALPHAS]
+        candidates += [("forest", inputs, depth, np.nan) for depth in DEPTH_GRID]
+        candidates += [("boosting", inputs, depth, rate) for rate in BOOST_RATES for depth in BOOST_DEPTHS]
     print("scoring", len(candidates), "candidates of the grids")
     scores = score_candidates(candidates)
     scores["round"] = "grid"
 
-    # 2. Completing the forest grid: once, per input set, before any selection.
+    # 2. Forest refinement, once, per input set: the 2 depths halfway to the
+    # neighbours of the best depth.
     table = candidate_table(scores)
     extra = []
     for inputs in INPUT_SETS:
         forest = table[(table["family"] == "forest") & (table["inputs"] == inputs)]
-        best_depth = forest.loc[forest["val_mae_mean"].idxmin(), "value"]
-        print("forest", inputs, ": best depth of the grid:", best_depth,
-              " added:", EXTRA_DEPTHS[best_depth])
-        for depth in EXTRA_DEPTHS[best_depth]:
-            extra.append(("forest", inputs, depth))
+        best_depth = forest.loc[forest["val_list_mae_mean"].idxmin(), "value"]
+        print("forest", inputs, ": best depth of the grid:", best_depth, " added:", EXTRA_DEPTHS[best_depth])
+        extra += [("forest", inputs, depth, np.nan) for depth in EXTRA_DEPTHS[best_depth]]
     more = score_candidates(extra)
-    more["round"] = "completed forest grid"
+    more["round"] = "forest refinement"
     scores = pd.concat([scores, more], ignore_index=True)
 
-    # 3. Selection: the one standard error rule on ALL candidates together.
+    # 3. Selection: the one standard error rule on all candidates together.
     table = candidate_table(scores)
     choice = one_se_rule(table)
-    edge_rule = "not used"
     first_choice = choice["chosen"]
-
-    # 4. Edge rule: chosen = ridge with the largest alpha of the grid.
-    chosen = table.set_index("name").loc[choice["chosen"]]
-    if chosen["family"] == "ridge" and chosen["value"] == max(ALPHA_GRID):
-        edge_rule = "used"
-        print("edge rule: adding the alphas", EDGE_ALPHAS, "for both input sets")
-        extra = [("ridge", inputs, alpha) for inputs in INPUT_SETS for alpha in EDGE_ALPHAS]
-        more = score_candidates(extra)
-        more["round"] = "edge rule"
+    edge = grid_edge(table[table["name"] == first_choice].iloc[0])
+    edge_rule = "not used"
+    stop_message = None
+    if isinstance(edge, list):
+        # 4. Grid edge: extend the grid of this family by 2 steps, for both input sets, once.
+        family = table[table["name"] == first_choice]["family"].iloc[0]
+        edge_rule = "used: " + family + " grid extended by " + ", ".join(format(v, "g") for v in edge)
+        print("grid edge:", edge_rule)
+        more = score_candidates([(family, inputs, value, np.nan) for inputs in INPUT_SETS for value in edge])
+        more["round"] = "grid edge"
         scores = pd.concat([scores, more], ignore_index=True)
         table = candidate_table(scores)
-        choice = one_se_rule(table)             # steps 1 to 4 again, only this once
-    final = choice["chosen"]
+        choice = one_se_rule(table)              # the selection again, only this once
+    elif edge == "undefined":
+        edge_rule = "STOP: the choice sits at the edge of a grid where the extension is not defined"
+        stop_message = edge_rule
 
-    # Write down the result of the rule next to the numbers.
+    final = choice["chosen"]
+    order = {name: number + 1 for number, name in enumerate(choice["eligible"])}
     table["eligible"] = table["name"].isin(choice["eligible"])
+    table["simplicity_order"] = table["name"].map(order)
     table["lowest_mean"] = table["name"] == choice["best"]
     table["final_model"] = table["name"] == final
     selection = pd.DataFrame([{"best": choice["best"], "best_mean": choice["best_mean"],
                                "se": choice["se"], "threshold": choice["threshold"],
                                "n_candidates": len(table), "n_eligible": len(choice["eligible"]),
-                               "final_model": final, "edge_rule": edge_rule,
-                               "choice_before_edge_rule": first_choice}])
+                               "final_model": final, "final_mean": choice["chosen_mean"],
+                               "final_raw_rank": choice["chosen_raw_rank"],
+                               "edge_rule": edge_rule, "choice_before_edge_rule": first_choice}])
 
     # 5. Reports that do not change the choice.
-    # Inside each family and input set: lowest mean, and the one SE pick of the group alone.
-    lines = []
-    for family in ["ridge", "forest"]:
+    groups = []
+    for family in FAMILY_ORDER:
         for inputs in INPUT_SETS:
-            group = table[(table["family"] == family) & (table["inputs"] == inputs)]
-            inside = one_se_rule(group)
-            lines.append({"family": family, "inputs": inputs,
-                          "lowest_mean": inside["best"], "lowest_mean_mae": inside["best_mean"],
-                          "se": inside["se"], "threshold": inside["threshold"],
-                          "one_se_pick": inside["chosen"],
-                          "one_se_pick_mae": group.set_index("name").loc[inside["chosen"], "val_mae_mean"]})
-    groups = pd.DataFrame(lines)
-
-    # Load hypothesis (per family: best FULL against best NO_LOAD), and ridge against forest.
-    best_ridge = best_name(table, family="ridge")
-    best_forest = best_name(table, family="forest")
-    comparisons = pd.DataFrame([
-        compare(scores, table, best_name(table, "ridge", "FULL"),
-                best_name(table, "ridge", "NO_LOAD"), "load, ridge: FULL minus NO_LOAD"),
-        compare(scores, table, best_name(table, "forest", "FULL"),
-                best_name(table, "forest", "NO_LOAD"), "load, forest: FULL minus NO_LOAD"),
-        compare(scores, table, best_ridge, best_forest, "ridge minus forest"),
-    ])
-
-    # Rows without and with history, best ridge and best forest.
-    history = table[table["name"].isin([best_ridge, best_forest])][
-        ["name", "val_mae_mean", "val_mae_std",
-         "val_mae_no_history_mean", "val_mae_no_history_std",
-         "val_mae_with_history_mean", "val_mae_with_history_std"]]
-
-    # 6. Looks that choose nothing.
+            name = best_name(table, family, inputs)
+            line = table[table["name"] == name].iloc[0]
+            groups.append({"family": family, "inputs": inputs, "best": name,
+                           "val_list_mae_mean": line["val_list_mae_mean"], "val_list_mae_std": line["val_list_mae_std"],
+                           "val_spearman_mean": line["val_spearman_mean"], "val_top10_mean": line["val_top10_mean"],
+                           "train_list_mae_mean": line["train_list_mae_mean"], "gap_val_minus_train": line["gap_val_minus_train"],
+                           "val_list_mae_no_history_mean": line["val_list_mae_no_history_mean"],
+                           "val_list_mae_with_history_mean": line["val_list_mae_with_history_mean"]})
+    groups = pd.DataFrame(groups)
+    comparisons = pd.DataFrame([compare(scores, table, best_name(table, family, "FULL"),
+                                        best_name(table, family, "NO_LOAD"),
+                                        "load, " + family + ": with minus without")
+                                for family in FAMILY_ORDER])
+    history = groups[["family", "inputs", "best", "val_list_mae_mean",
+                      "val_list_mae_no_history_mean", "val_list_mae_with_history_mean"]]
     depth_curve = table[table["family"] == "forest"][
-        ["inputs", "value", "name", "train_mae_mean", "val_mae_mean", "val_mae_se"]]
+        ["inputs", "value", "name", "train_list_mae_mean", "val_list_mae_mean", "val_list_mae_se"]]
     depth_curve = depth_curve.sort_values(["inputs", "value"])
+    boost = scores[(scores["family"] == "boosting") & (scores["part"] == "validation")]
+    boosting_trees = boost.pivot(index="name", columns="val_season", values="trees_used")
+    boosting_trees["mean"] = boosting_trees.mean(axis=1)
+    boosting_trees = boosting_trees.reset_index()
 
-    # Learning curve: the final model and the best candidate of the other family.
-    final_family = table.set_index("name").loc[final, "family"]
-    other = best_forest if final_family == "ridge" else best_ridge
-    print("learning curve:", final, "and", other)
-    curve_folds = learning_curve(table, [final, other])
-    curve = curve_folds.groupby(["name", "share"])[["n_train_rows", "train_mae", "val_mae"]].mean().reset_index()
-    curve["role"] = np.where(curve["name"] == final, "final model", "best of the other family")
+    # Learning curve: the final model and the best candidate of each other family.
+    final_family = table[table["name"] == final]["family"].iloc[0]
+    names = [final] + [best_name(table, family) for family in FAMILY_ORDER if family != final_family]
+    print("learning curve:", ", ".join(names))
+    curve_folds = learning_curve(table, names)
+    curve = curve_folds.groupby(["name", "share"])[["n_train_races", "n_train_rows",
+                                                    "train_list_mae", "val_list_mae"]].mean().reset_index()
+    curve["role"] = np.where(curve["name"] == final, "final model", "best of another family")
 
-    # Forest importances: FULL inputs, the depth with the lowest mean.
-    forest_full = table[(table["family"] == "forest") & (table["inputs"] == "FULL")]
-    importance = importance_table(forest_full.loc[forest_full["val_mae_mean"].idxmin(), "value"])
+    importance = importance_table(best_name(table, family="forest"), table)
 
-    # 7. Save and print.
+    # 6. Save and print.
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     tables = {"models_scores_per_fold": scores, "models_candidates": table,
               "models_selection": selection, "models_groups": groups,
               "models_comparisons": comparisons, "models_history": history,
-              "models_depth_curve": depth_curve, "models_learning_curve": curve,
-              "models_learning_curve_per_fold": curve_folds,
+              "models_depth_curve": depth_curve, "models_boosting_trees": boosting_trees,
+              "models_learning_curve": curve, "models_learning_curve_per_fold": curve_folds,
               "models_importance": importance}
     for name, one in tables.items():
         one.to_csv(os.path.join(OUTPUT_DIR, name + ".csv"), index=False)
 
-    print("\n--- all candidates, best mean validation MAE first ---")
-    show = ["name", "train_mae_mean", "val_mae_mean", "val_mae_std", "val_mae_se",
-            "val_rmse_mean", "val_r2_mean", "val_spearman_mean", "val_top10_mean",
-            "eligible", "final_model"]
-    print(table[show].round(4).to_string(index=False))
-
+    print("\n--- all candidates, best mean validation list MAE first ---")
+    show = ["raw_rank", "name", "simplicity_inputs", "train_list_mae_mean", "val_list_mae_mean",
+            "val_list_mae_std", "val_spearman_mean", "val_top10_mean", "eligible", "final_model"]
+    print(table[show].round(5).to_string(index=False))
     print("\n--- selection: the one standard error rule on all", len(table), "candidates ---")
-    print("lowest mean validation MAE:", choice["best"], " mean:", round(choice["best_mean"], 5))
-    print("SE:", round(choice["se"], 5), "  threshold = mean + SE:", round(choice["threshold"], 5))
-    print("eligible candidates:", len(choice["eligible"]))
+    print("best     :", choice["best"], " mean:", round(choice["best_mean"], 5))
+    print("SE       :", round(choice["se"], 5), "  threshold = best + SE:", round(choice["threshold"], 5))
+    print("eligible :", len(choice["eligible"]), "of", len(table))
     print("simplest eligible first:")
-    print(simplest_first(table[table["eligible"]])[["name", "val_mae_mean"]].round(5).to_string(index=False))
-    print("edge rule:", edge_rule)
+    print(simplest_first(table[table["eligible"]])[["name", "simplicity_inputs", "val_list_mae_mean", "trees_used_mean"]]
+          .round(5).to_string(index=False))
+    print("grid edge:", edge_rule, "  (choice before: " + first_choice + ")")
     print("\n==============================================")
-    print("THE FINAL MODEL:", final)
+    print("THE FINAL MODEL:", final, "  mean validation list MAE:", round(choice["chosen_mean"], 5),
+          "  raw rank:", choice["chosen_raw_rank"], "of", len(table))
     print("==============================================")
-
-    print("\n--- inside each family and input set ---")
+    print("\n--- best of each family and input set ---")
     print(groups.round(5).to_string(index=False))
-    print("\n--- comparisons: validation MAE, difference = a minus b ---")
-    print(comparisons.round(5).T.to_string(header=False))
-    print("\n--- validation MAE, rows without and with history ---")
-    print(history.round(4).to_string(index=False))
-    print("\n--- depth curve of the forest ---")
-    print(depth_curve.round(4).to_string(index=False))
+    print("\n--- with load minus without load, per family ---")
+    print(comparisons.round(5).to_string(index=False))
+    print("\n--- boosting: trees used per fold ---")
+    print(boosting_trees.round(1).to_string(index=False))
     print("\n--- learning curve: mean over the 5 folds ---")
-    print(curve.round(4).to_string(index=False))
-    print("\n--- forest importances (FULL inputs, depth", importance["depth"].iloc[0], "), all training seasons ---")
+    print(curve.round(5).to_string(index=False))
+    print("\n--- forest importances, FIRST LOOK ONLY:", importance["forest"].iloc[0], "---")
     print(importance[["feature", "importance"]].round(4).to_string(index=False))
+    print("\nwarnings: convergence", int(scores["convergence_warnings"].sum() / 2),
+          "  other", int(scores["other_warnings"].sum() / 2), "(fits, each counted once)")
     print("\nsaved in " + OUTPUT_DIR + "/:", ", ".join(name + ".csv" for name in tables))
+    if stop_message is not None:
+        sys.exit(stop_message + ". Ask before going on.")
 
 
 # ------------------------------------------------------------------ robustness
-# Step 6, part A. Training and validation seasons only. It changes nothing:
-# it only tells us if the conclusions of step 5 hold with another split.
+# The robustness run: training and validation seasons only. It changes
+# nothing: it only tells us if the conclusions of step 5 hold with another
+# split. Each validation season is predicted from the 5 seasons just before
+# it (a rolling window), not from all earlier seasons.
 
 def run_robustness():
-    """Score the 34 candidates of step 5 again on the sliding window folds
-    and apply the one standard error rule with the same simplicity order."""
-    # The same candidates as in the final table of step 5. No new round.
+    """Score exactly the 64 candidates of step 5 on the rolling window folds,
+    and apply the same selection rule. No refinement round, no grid extension."""
     step5 = load_output("models_candidates")
-    candidates = [(line["family"], line["inputs"], line["value"])
+    # The same 4 parts as in step 5: family, input set, value, learning rate.
+    candidates = [(line["family"], line["inputs"], line["value"], line["learning_rate"])
                   for index, line in step5.iterrows()]
-    print("scoring", len(candidates), "candidates on the sliding window folds")
+    print("scoring", len(candidates), "candidates of step 5 on the rolling window folds")
     scores = score_candidates(candidates, folds_function=make_window_folds)
 
     table = candidate_table(scores)
     choice = one_se_rule(table)
+    final_step5 = step5[step5["final_model"]]["name"].iloc[0]
+    order = {name: number + 1 for number, name in enumerate(choice["eligible"])}
     table["eligible"] = table["name"].isin(choice["eligible"])
+    table["simplicity_order"] = table["name"].map(order)
     table["lowest_mean"] = table["name"] == choice["best"]
     table["one_se_choice"] = table["name"] == choice["chosen"]
-    final_step5 = step5[step5["final_model"]]["name"].iloc[0]
     table["final_model_of_step_5"] = table["name"] == final_step5
+    step5_selection = load_output("models_selection").iloc[0]
     selection = pd.DataFrame([{"best": choice["best"], "best_mean": choice["best_mean"],
                                "se": choice["se"], "threshold": choice["threshold"],
                                "n_candidates": len(table), "n_eligible": len(choice["eligible"]),
-                               "one_se_choice": choice["chosen"],
-                               "final_model_of_step_5": final_step5}])
+                               "one_se_choice": choice["chosen"], "one_se_choice_mean": choice["chosen_mean"],
+                               "one_se_choice_raw_rank": choice["chosen_raw_rank"],
+                               "final_model_of_step_5": final_step5,
+                               "same_model": choice["chosen"] == final_step5,
+                               "step5_best": step5_selection["best"], "step5_best_mean": step5_selection["best_mean"],
+                               "step5_se": step5_selection["se"], "step5_threshold": step5_selection["threshold"],
+                               "step5_n_eligible": step5_selection["n_eligible"]}])
 
-    comparisons = pd.DataFrame([
-        compare(scores, table, best_name(table, family="ridge"),
-                best_name(table, family="forest"), "ridge minus forest"),
-        compare(scores, table, best_name(table, "ridge", "FULL"),
-                best_name(table, "ridge", "NO_LOAD"), "load, ridge: FULL minus NO_LOAD"),
-        compare(scores, table, best_name(table, "forest", "FULL"),
-                best_name(table, "forest", "NO_LOAD"), "load, forest: FULL minus NO_LOAD"),
-    ])
+    # The best of each family (over both input sets), next to step 5.
+    groups = []
+    for family in FAMILY_ORDER:
+        name = best_name(table, family=family)
+        line = table[table["name"] == name].iloc[0]
+        name5 = best_name(step5, family=family)
+        line5 = step5[step5["name"] == name5].iloc[0]
+        groups.append({"family": family, "best": name, "val_list_mae_mean": line["val_list_mae_mean"],
+                       "val_list_mae_std": line["val_list_mae_std"],
+                       "step5_best": name5, "step5_val_list_mae_mean": line5["val_list_mae_mean"],
+                       "step5_val_list_mae_std": line5["val_list_mae_std"]})
+    groups = pd.DataFrame(groups)
+
+    # With load minus without load, per family.
+    comparisons = pd.DataFrame([compare(scores, table, best_name(table, family, "FULL"),
+                                        best_name(table, family, "NO_LOAD"),
+                                        "load, " + family + ": with minus without")
+                                for family in FAMILY_ORDER])
+
+    # The final model of step 5: rolling window against all earlier seasons, per fold.
+    step5_scores = load_output("models_scores_per_fold")
+    per_fold = pd.DataFrame({
+        "val_season": VALIDATION_SEASONS,
+        "all_earlier_list_mae": fold_values(step5_scores, final_step5),
+        "rolling_window_list_mae": fold_values(scores, final_step5)})
+    per_fold["window_minus_all_earlier"] = per_fold["rolling_window_list_mae"] - per_fold["all_earlier_list_mae"]
+    train_rows = scores[(scores["name"] == final_step5) & (scores["part"] == "train")].sort_values("fold")
+    per_fold["rolling_window_train_rows"] = train_rows["n_rows"].to_numpy()
+    train5 = step5_scores[(step5_scores["name"] == final_step5) & (step5_scores["part"] == "train")].sort_values("fold")
+    per_fold["all_earlier_train_rows"] = train5["n_rows"].to_numpy()
+    per_fold["model"] = final_step5
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     tables = {"robustness_scores_per_fold": scores, "robustness_candidates": table,
-              "robustness_selection": selection, "robustness_comparisons": comparisons}
+              "robustness_selection": selection, "robustness_groups": groups,
+              "robustness_comparisons": comparisons, "robustness_final_per_fold": per_fold}
     for name, one in tables.items():
         one.to_csv(os.path.join(OUTPUT_DIR, name + ".csv"), index=False)
 
-    print("\n--- sliding window: all candidates, best mean validation MAE first ---")
-    show = ["name", "train_mae_mean", "val_mae_mean", "val_mae_std", "val_mae_se",
-            "eligible", "one_se_choice", "final_model_of_step_5"]
-    print(table[show].round(5).to_string(index=False))
-    print("\n--- the one standard error rule, same simplicity order ---")
-    print("best:", choice["best"], " mean:", round(choice["best_mean"], 5),
-          " SE:", round(choice["se"], 5), " threshold:", round(choice["threshold"], 5))
-    print("eligible:", len(choice["eligible"]), "of", len(table))
-    print("the rule would choose:", choice["chosen"])
-    print("final model of step 5:", final_step5)
-    print("\n--- comparisons: validation MAE, difference = a minus b ---")
-    print(comparisons.round(5).T.to_string(header=False))
+    print("\n--- rolling window: the one standard error rule (step 5 in brackets) ---")
+    print("best      :", choice["best"], round(choice["best_mean"], 5),
+          " (", step5_selection["best"], round(step5_selection["best_mean"], 5), ")")
+    print("SE        :", round(choice["se"], 5), " (", round(step5_selection["se"], 5), ")")
+    print("threshold :", round(choice["threshold"], 5), " (", round(step5_selection["threshold"], 5), ")")
+    print("eligible  :", len(choice["eligible"]), "of", len(table), " (", step5_selection["n_eligible"], ")")
+    print("choice    :", choice["chosen"], round(choice["chosen_mean"], 5), " raw rank", choice["chosen_raw_rank"],
+          " (", final_step5, ")   same model:", choice["chosen"] == final_step5)
+    print("\n--- best of each family ---")
+    print(groups.round(5).to_string(index=False))
+    print("\n--- with load minus without load ---")
+    print(comparisons.round(5).to_string(index=False))
+    print("\n--- final model of step 5: rolling window against all earlier seasons ---")
+    print(per_fold.round(5).to_string(index=False))
     print("\nsaved in " + OUTPUT_DIR + "/:", ", ".join(name + ".csv" for name in tables))
 
 
 # ------------------------------------------------------------------ final test
-# Step 6, part B. The functions below get the training rows and the test rows
-# as 2 tables. Only run_test() loads the real test rows.
+# Step 6: the final test. The functions below get the training rows and the
+# test rows as 2 tables. Only run_test() and load_test_data() load the real
+# test rows.
 
 def load_test_rows():
     """Load the rows of the TEST seasons from data/features.csv.
     Only the command 'python pipeline.py test' may call this function."""
+    if not TEST_UNLOCKED:
+        sys.exit("Step 6 is locked: TEST_UNLOCKED is False in pipeline.py. The test seasons were not read.")
     df = pd.read_csv(FEATURES_FILE, dtype={"season": str})
     return df[df["season"].isin(TEST_SEASONS)].reset_index(drop=True)
 
@@ -1273,26 +1382,41 @@ def load_test_predictions():
 
 
 def fit_final_model(train):
-    """Fit the frozen final pipeline on the given training rows."""
-    model = make_ridge(FINAL_ALPHA)
+    """Fit the frozen final model on the given training rows. make_model
+    builds the same pipeline as in step 5: median fill, scale, lasso with
+    alpha 0.01 and at most 10,000 rounds."""
+    model = make_model(FINAL_FAMILY, FINAL_VALUE)
     model.fit(train[INPUT_SETS[FINAL_INPUTS]], train[TARGET])
     return model
 
 
-def add_predictions(model, rows):
-    """Add the predictions of the 3 models to the rows, and the places."""
+def fit_baselines(train):
+    """The 2 simple models learn their single number from the same training
+    rows as the final model, as in step 4: the constant takes the mean of the
+    target, the naive rule fills empty cells with the median of last3_finish_pct."""
+    return {"constant_value": train[TARGET].mean(),
+            "naive_fill": train["last3_finish_pct"].median()}
+
+
+def add_predictions(model, baselines, rows):
+    """Add the predictions of the 3 models to the rows, then the predicted
+    list of each model. The list is made on the WHOLE race, before any
+    slice is cut."""
     rows = rows.copy()
     rows["pred_final"] = model.predict(rows[INPUT_SETS[FINAL_INPUTS]])
-    rows["pred_constant"] = predict_constant(rows)
-    rows["pred_naive"] = predict_naive(rows)
+    rows["pred_constant"] = predict_constant(rows, baselines["constant_value"])
+    rows["pred_naive"] = predict_naive(rows, baselines["naive_fill"])
     # The real place, found again from the percentile: pct = (place - 1) / (n - 1).
     rows["n_finishers"] = rows.groupby("race_id")[TARGET].transform("count")
     rows["real_place"] = (rows[TARGET] * (rows["n_finishers"] - 1)).round().astype(int) + 1
-    # The predicted rank: the order of the predictions inside the race, 1 = lowest.
-    rows["pred_rank"] = rows.groupby("race_id")["pred_final"].rank(method="min").astype(int)
-    # The same prediction written as a place: place = pct * (n - 1) + 1.
-    rows["pred_place"] = rows["pred_final"] * (rows["n_finishers"] - 1) + 1
-    rows["error"] = rows["pred_final"] - rows[TARGET]          # prediction minus real
+    # The predicted list of each model, written as a percentile (the same
+    # function as the list metrics, so the same tie break by the race seed).
+    for name, column in TEST_MODELS.items():
+        rows["list_pct_" + name] = list_percentile(rows, rows[column])
+    # The place of the athlete in the predicted list of the final model, 1 to n.
+    rows["pred_place"] = (rows["list_pct_final"] * (rows["n_finishers"] - 1)).round().astype(int) + 1
+    # The error of the final model: predicted percentile from the list minus the real one.
+    rows["error"] = rows["list_pct_final"] - rows[TARGET]
     rows["abs_error"] = rows["error"].abs()
     return rows
 
@@ -1312,125 +1436,150 @@ def test_score_table(rows):
     return pd.DataFrame(lines)
 
 
+def test_validation_table(scores):
+    """The 5 scores on the 3 test seasons together, next to the validation
+    scores (mean over the 5 folds). Final model: from step 5. Constant and
+    naive rule: from step 4 (the same folds). Only open seasons are read here."""
+    candidates = load_output("models_candidates").set_index("name")
+    final = candidates.loc[candidate_name(FINAL_FAMILY, FINAL_INPUTS, FINAL_VALUE)]
+    ladder = load_output("baselines_ladder")
+    ladder = ladder[ladder["part"] == "validation"].set_index("model")
+    test = scores[scores["scope"] == "all"].set_index("model")
+    lines = []
+    for model in ["constant", "naive", "final"]:
+        for score in SCORES:
+            if model == "final":
+                validation = final["val_" + score + "_mean"]
+            else:
+                validation = ladder.loc[model, score + "_mean"]
+            lines.append({"model": model, "score": score, "validation": validation,
+                          "test": test.loc[model, score],
+                          "test_minus_validation": test.loc[model, score] - validation})
+    return pd.DataFrame(lines)
+
+
 def test_race_table(rows):
-    """1 line per race: the MAE of the 3 models. No athlete in this table."""
+    """1 line per race: the list MAE of the 3 models. No athlete in this table."""
     lines = []
     for race_id, race in rows.groupby("race_id"):
         line = {"race_id": race_id, "season": race["season"].iloc[0],
                 "day": race["start"].iloc[0][:10], "place": race["place"].iloc[0],
                 "gender": race["gender"].iloc[0],
                 "is_major_event": race["is_major_event"].iloc[0], "rows": len(race)}
-        for model, column in TEST_MODELS.items():
-            line["mae_" + model] = mae(race, race[column])
+        for model in TEST_MODELS:
+            # The list of the whole race was made in add_predictions.
+            line["list_mae_" + model] = (race["list_pct_" + model] - race[TARGET]).abs().mean()
         lines.append(line)
     table = pd.DataFrame(lines)
-    # Number the races from the lowest MAE of the final model to the highest.
-    table = table.sort_values(["mae_final", "race_id"]).reset_index(drop=True)
-    table["number_by_mae"] = table.index + 1
-    table["story_race"] = table["number_by_mae"] == STORY_NUMBER
+    # Number the races from the lowest list MAE of the final model to the highest.
+    table = table.sort_values(["list_mae_final", "race_id"]).reset_index(drop=True)
+    table["number_by_list_mae"] = table.index + 1
+    table["story_race"] = table["number_by_list_mae"] == STORY_NUMBER
     return table.sort_values(["day", "race_id"]).reset_index(drop=True)
 
 
 def test_slice_table(rows):
-    """The MAE and the mean signed error (prediction minus real) of the
-    3 models in each group of the 5 slices."""
+    """For each group of the 5 slices: the mean absolute error and the mean
+    signed error (predicted percentile from the list minus real percentile)
+    of the final model and of the naive rule. The lists were made on the
+    whole race first, then the rows are split into groups."""
     real = rows[TARGET]
-    days = rows["days_since_sprint"]
+    sprints = rows["n_sprints_window"]
     slices = [
-        ("a) championship", "World Championships and Olympics", rows["is_major_event"] == True),
-        ("a) championship", "other sprints", rows["is_major_event"] == False),
-        ("b) history", "no_history = 1", rows["no_history"] == 1),
-        ("b) history", "no_history = 0", rows["no_history"] == 0),
-        ("c) gender", "men", rows["gender"] == "SM"),
-        ("c) gender", "women", rows["gender"] == "SW"),
-        ("d) real finish percentile", "up to 0.10", real <= PCT_FRONT),
-        ("d) real finish percentile", "between", (real > PCT_FRONT) & (real < PCT_BACK)),
-        ("d) real finish percentile", "0.90 and above", real >= PCT_BACK),
-        ("e) days since the last sprint", "up to 30", days <= DAYS_SHORT),
-        ("e) days since the last sprint", "31 to 180", (days > DAYS_SHORT) & (days <= DAYS_LONG)),
-        ("e) days since the last sprint", "above 180", days > DAYS_LONG),
-        ("e) days since the last sprint", "no history (apart)", days.isna()),
+        ("1) championship", "World Championships and Olympics", rows["is_major_event"] == True),
+        ("1) championship", "other sprints", rows["is_major_event"] == False),
+        ("2) history", "with history (no_history = 0)", rows["no_history"] == 0),
+        ("2) history", "without history (no_history = 1)", rows["no_history"] == 1),
+        ("3) gender", "men", rows["gender"] == "SM"),
+        ("3) gender", "women", rows["gender"] == "SW"),
+        ("4) real finish position", "top 10 % (up to 0.10)", real <= PCT_FRONT),
+        ("4) real finish position", "middle", (real > PCT_FRONT) & (real < PCT_BACK)),
+        ("4) real finish position", "bottom 10 % (0.90 and above)", real >= PCT_BACK),
+        ("5) n_sprints_window", "0 to 3", sprints <= SPRINTS_FEW),
+        ("5) n_sprints_window", "4 to 9", (sprints > SPRINTS_FEW) & (sprints < SPRINTS_MANY)),
+        ("5) n_sprints_window", "10 or more", sprints >= SPRINTS_MANY),
     ]
     lines = []
     for slice_name, group, keep in slices:
         part = rows[keep]
-        for model, column in TEST_MODELS.items():
+        for model in SLICE_MODELS:
+            signed = part["list_pct_" + model] - part[TARGET]
             lines.append({"slice": slice_name, "group": group, "model": model,
                           "rows": len(part), "races": part["race_id"].nunique(),
-                          "mae": mae(part, part[column]) if len(part) > 0 else np.nan,
-                          "mean_signed_error": (part[column] - part[TARGET]).mean()})
+                          "mean_abs_error": signed.abs().mean(),
+                          "mean_signed_error": signed.mean()})
     return pd.DataFrame(lines)
 
 
 def test_permutation_table(model, rows):
-    """Permutation importance of the final model: shuffle 1 input (or 1 group
-    of inputs) between the rows, and see how much the MAE goes up. A big
-    increase means the model needs this input. 20 repeats, sample standard
-    deviation (ddof = 1)."""
+    """Permutation importance of the final model on the test rows: shuffle
+    1 input (or 1 group of inputs) between the rows, so that it no longer
+    belongs to the right athlete, and see how much the list MAE goes up.
+    A big increase means the model needs this input. 20 repeats, sample
+    standard deviation (ddof = 1)."""
     columns = INPUT_SETS[FINAL_INPUTS]
     X = rows[columns]
-    y = rows[TARGET]
+    weights = pd.Series(model.named_steps["lasso"].coef_, index=columns)
+    base = list_mae(rows, model.predict(X))               # nothing shuffled
+
+    # a) each input alone, b) each group: the columns of a group get the SAME
+    # new row order, so the values of the group stay together.
+    parts = [("a) each input alone", name, [name]) for name in columns]
+    parts = parts + [("b) by group", group, members) for group, members in INPUT_GROUPS.items()]
     lines = []
-
-    # a) Each input alone, with the function of scikit-learn. Its score is
-    # "minus MAE" (higher = better), so its importance is the increase in MAE.
-    result = permutation_importance(model, X, y, scoring="neg_mean_absolute_error",
-                                    n_repeats=PERM_REPEATS, random_state=PERM_SEED)
-    for number, name in enumerate(columns):
-        increases = result.importances[number]             # the 20 increases of this input
-        lines.append({"version": "a) each input alone", "name": name, "inputs": name,
-                      "mae_increase_mean": increases.mean(),
-                      "mae_increase_std": increases.std(ddof=1)})
-
-    # b) By group: the columns of a group get the SAME new row order, so the
-    # values of the group stay together and only their link to the athlete is cut.
-    base = mae(rows, model.predict(X))
-    for group, members in INPUT_GROUPS.items():
-        rng = np.random.RandomState(PERM_SEED)             # the same seed for every group
+    for version, name, members in parts:
+        rng = np.random.RandomState(PERM_SEED)             # the same seed for every input and group
         increases = []
         for repeat in range(PERM_REPEATS):
             order = rng.permutation(len(X))                # a random order of the rows
             shuffled = X.copy()
             shuffled[members] = X[members].to_numpy()[order]
-            increases.append(mae(rows, model.predict(shuffled)) - base)
+            increases.append(list_mae(rows, model.predict(shuffled)) - base)
         increases = np.array(increases)
-        lines.append({"version": "b) by group", "name": group, "inputs": ", ".join(members),
-                      "mae_increase_mean": increases.mean(),
-                      "mae_increase_std": increases.std(ddof=1)})
+        lines.append({"version": version, "name": name, "inputs": ", ".join(members),
+                      # True if the lasso set the weight of every input here to 0.
+                      "lasso_weight_zero": bool((weights[members] == 0).all()),
+                      "list_mae_increase_mean": increases.mean(),
+                      "list_mae_increase_std": increases.std(ddof=1)})
 
     table = pd.DataFrame(lines)
-    table["mae_not_shuffled"] = base
+    table["list_mae_not_shuffled"] = base
     table["repeats"] = PERM_REPEATS
-    return table.sort_values(["version", "mae_increase_mean"], ascending=[True, False]).reset_index(drop=True)
+    return table.sort_values(["version", "list_mae_increase_mean"], ascending=[True, False]).reset_index(drop=True)
 
 
 def final_weights_table(model):
-    """The weights of the fitted final model, sorted by size, with the numbers
-    that the fill step and the scale step learned."""
+    """The weights of the fitted final lasso, on the scaled inputs, sorted by
+    size (the zeros last), with the numbers that the fill step and the scale
+    step learned."""
+    lasso = model.named_steps["lasso"]
     table = pd.DataFrame({"feature": INPUT_SETS[FINAL_INPUTS],
-                          "weight": model.named_steps["ridge"].coef_,
+                          # + 0.0 turns a weight of -0.0 into 0.0, so that no "-0" is printed.
+                          "weight": lasso.coef_ + 0.0,
                           "fill_median": model.named_steps["fill"].statistics_,
                           "scale_mean": model.named_steps["scale"].mean_,
                           "scale_spread": model.named_steps["scale"].scale_})
     table["size"] = table["weight"].abs()
-    table = table.sort_values("size", ascending=False).reset_index(drop=True)
-    table["alpha"] = model.named_steps["ridge"].alpha
-    table["intercept"] = model.named_steps["ridge"].intercept_
+    table["dropped"] = table["weight"] == 0               # the lasso set this weight to 0
+    table = table.sort_values(["size", "feature"], ascending=[False, True]).reset_index(drop=True)
+    table["alpha"] = lasso.alpha
+    table["intercept"] = lasso.intercept_
+    table["rounds_used"] = lasso.n_iter_                  # rounds the lasso needed (at most 10,000)
     return table
 
 
 def draw_story(race, title, path=None):
-    """The story figure: predicted rank against real rank in 1 race,
-    1 dot per athlete, no names. If a path is given, the figure is saved."""
+    """The story figure: place in the predicted list against real place in
+    1 race, 1 dot per athlete, no names. If a path is given, the figure is saved."""
     import matplotlib.pyplot as plt
     n = len(race)
     fig, ax = plt.subplots(figsize=(6.5, 6.5))
     ax.plot([1, n], [1, n], color="#52514e", linewidth=1, linestyle="--",
             label="perfect prediction")
-    ax.scatter(race["real_place"], race["pred_rank"], s=28, color="#2a78d6",
+    ax.scatter(race["real_place"], race["pred_place"], s=28, color="#2a78d6",
                edgecolor="white", linewidth=0.6, label="1 athlete")
-    ax.set_xlabel("real rank")
-    ax.set_ylabel("predicted rank")
+    ax.set_xlabel("real place")
+    ax.set_ylabel("place in the predicted list")
     ax.set_title(title)
     ax.set_xlim(0, n + 2)
     ax.set_ylim(0, n + 2)
@@ -1448,23 +1597,31 @@ def story_title(race_line):
     """The title of the story figure, made from the line of the race table."""
     who = "men" if race_line["gender"] == "SM" else "women"
     return (race_line["place"] + ", " + race_line["day"] + ", " + who
-            + "\nMAE " + format(race_line["mae_final"], ".3f")
-            + " (number " + str(STORY_NUMBER) + " of the races sorted by MAE)")
+            + "\nlist MAE " + format(race_line["list_mae_final"], ".3f")
+            + " (number " + str(STORY_NUMBER) + " of the races sorted by list MAE)")
 
 
 def test_tables(train, test):
-    """Everything of part B for the given training rows and test rows:
-    fit the final model on the training rows, predict the test rows, and
-    build every table. Nothing is saved here."""
-    model = fit_final_model(train)
-    rows = add_predictions(model, test)
-    return {"model": model,
-            "predictions": rows,
-            "scores": test_score_table(rows),
-            "races": test_race_table(rows),
-            "slices": test_slice_table(rows),
-            "permutation": test_permutation_table(model, rows),
-            "weights": final_weights_table(model)}
+    """Everything of step 6 for the given training rows and test rows:
+    fit the 3 models on the training rows, predict the test rows, and build
+    every table. Every warning is caught and counted. Nothing is saved here."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model = fit_final_model(train)
+        baselines = fit_baselines(train)
+        rows = add_predictions(model, baselines, test)
+        scores = test_score_table(rows)
+        tables = {"model": model,
+                  "baselines": baselines,
+                  "predictions": rows,
+                  "scores": scores,
+                  "versus_validation": test_validation_table(scores),
+                  "races": test_race_table(rows),
+                  "slices": test_slice_table(rows),
+                  "permutation": test_permutation_table(model, rows),
+                  "weights": final_weights_table(model)}
+    tables["warnings"] = [w.category.__name__ + ": " + str(w.message) for w in caught]
+    return tables
 
 
 def load_test_data():
@@ -1488,13 +1645,18 @@ def load_test_data():
         problems.append("a training race starts after a test race")
     if sorted(test["season"].unique()) != TEST_SEASONS:
         problems.append("test seasons: " + str(sorted(test["season"].unique())))
+    # The groups of the permutation importance must hold each input exactly once.
+    grouped = sorted(name for members in INPUT_GROUPS.values() for name in members)
+    if grouped != sorted(INPUT_SETS[FINAL_INPUTS]):
+        problems.append("INPUT_GROUPS do not match the final inputs")
     if len(problems) > 0:
         sys.exit("STOPPED before any test score was computed: " + "; ".join(problems))
     return train, test
 
 
 def run_test():
-    """Step 6, part B: the final test."""
+    """Step 6: the final test. Run once; a rerun of the same code may only
+    reproduce the same numbers."""
     train, test = load_test_data()
     print("training rows:", len(train), "  seasons", train["season"].min(), "to", train["season"].max(),
           "  latest start:", train["start"].max()[:10])
@@ -1508,40 +1670,54 @@ def run_test():
 
     # Save. outputs/ gets the tables without athletes and the figure.
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    saved = {"test_scores": tables["scores"], "test_mae_per_race": races,
-             "test_slices": tables["slices"], "test_permutation": tables["permutation"],
-             "test_weights": tables["weights"]}
+    saved = {"test_scores": tables["scores"], "test_vs_validation": tables["versus_validation"],
+             "test_list_mae_per_race": races, "test_slices": tables["slices"],
+             "test_permutation": tables["permutation"], "test_weights": tables["weights"]}
     for name, one in saved.items():
         one.to_csv(os.path.join(OUTPUT_DIR, name + ".csv"), index=False)
     # The per athlete predictions go to data/, which is not in git.
     keep = ["race_id", "season", "start", "place", "gender", "IBUId", "Name", "Nat",
-            "is_major_event", TARGET, "no_history", "days_since_sprint", "n_finishers",
-            "real_place", "pred_final", "pred_rank", "pred_place", "pred_constant",
-            "pred_naive", "error", "abs_error"]
+            "is_major_event", TARGET, "no_history", "n_sprints_window", "n_finishers",
+            "real_place", "pred_final", "list_pct_final", "pred_place",
+            "pred_naive", "list_pct_naive", "pred_constant", "list_pct_constant",
+            "error", "abs_error"]
     rows[keep].to_csv(TEST_PREDICTIONS_FILE, index=False)
-    # The story figure: the race with the middle MAE.
+    # The story figure: the race in the middle of the list MAE order.
     story = races[races["story_race"]].iloc[0]
     draw_story(rows[rows["race_id"] == story["race_id"]], story_title(story),
                os.path.join(OUTPUT_DIR, STORY_FIGURE))
 
-    model = tables["model"]
-    print("final model  : ridge, alpha", model.named_steps["ridge"].alpha, ",",
-          len(INPUT_SETS[FINAL_INPUTS]), "inputs:", ", ".join(INPUT_SETS[FINAL_INPUTS]))
+    weights = tables["weights"]
+    print("final model  :", candidate_name(FINAL_FAMILY, FINAL_INPUTS, FINAL_VALUE), ",",
+          len(INPUT_SETS[FINAL_INPUTS]), "inputs, nonzero weights:", int((~weights["dropped"]).sum()))
+    print("constant value:", round(tables["baselines"]["constant_value"], 5),
+          "  naive fill:", round(tables["baselines"]["naive_fill"], 5))
+    print("warnings     :", len(tables["warnings"]))
+    for text in tables["warnings"]:
+        print("   ", text)
 
-    print("\n--- test scores: the 3 seasons together, then each season ---")
-    print(tables["scores"].round(4).to_string(index=False))
-    print("\n--- MAE per race (the final model): summary of the", len(races), "races ---")
-    print(races["mae_final"].describe().round(4).to_string())
+    print("\n--- test (3 seasons together) next to validation (mean over the 5 folds) ---")
+    print(tables["versus_validation"].round(5).to_string(index=False))
+    print("\n--- test scores per season ---")
+    print(tables["scores"].round(5).to_string(index=False))
+    print("\n--- list MAE per race (the final model): summary of the", len(races), "races ---")
+    print(races["list_mae_final"].describe().round(5).to_string())
     print("championship sprints:", int(races["is_major_event"].sum()), "(expected 6)")
-    print("\n--- slices: MAE and mean signed error (prediction minus real) ---")
-    print(tables["slices"].round(4).to_string(index=False))
-    print("\n--- permutation importance on the test rows: increase in MAE ---")
-    print(tables["permutation"][["version", "name", "mae_increase_mean", "mae_increase_std"]]
-          .round(5).to_string(index=False))
-    print("\n--- weights of the refitted final model ---")
-    print(tables["weights"][["feature", "weight"]].round(4).to_string(index=False))
+    print("\n--- slices: mean absolute and mean signed error (list percentile minus real) ---")
+    print(tables["slices"].round(5).to_string(index=False))
+    permutation = tables["permutation"]
+    print("\n--- permutation importance on the test rows: increase in list MAE ---")
+    print(permutation[["version", "name", "lasso_weight_zero", "list_mae_increase_mean",
+                       "list_mae_increase_std"]].round(5).to_string(index=False))
+    zero = permutation[permutation["lasso_weight_zero"]]
+    print("inputs with a lasso weight of 0 show exactly 0:",
+          bool((zero["list_mae_increase_mean"] == 0).all() and (zero["list_mae_increase_std"] == 0).all()),
+          " (" + str(len(zero)) + " lines)")
+    print("\n--- weights of the refitted final lasso, on the scaled inputs ---")
+    print(weights[["feature", "weight", "dropped"]].round(5).to_string(index=False))
+    print("intercept:", round(weights["intercept"].iloc[0], 5), "  rounds used:", int(weights["rounds_used"].iloc[0]))
     print("\nstory race:", story["race_id"], story["place"], story["day"],
-          " MAE:", round(story["mae_final"], 4))
+          " list MAE:", round(story["list_mae_final"], 5))
     print("\nsaved in " + OUTPUT_DIR + "/:", ", ".join(name + ".csv" for name in saved),
           "and", STORY_FIGURE)
     print("saved in data/ (not in git):", TEST_PREDICTIONS_FILE)
