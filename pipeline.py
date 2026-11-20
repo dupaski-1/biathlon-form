@@ -6,7 +6,9 @@
 #   python pipeline.py baselines   score the 3 baseline models, save the tables in outputs/
 #   python pipeline.py models      ridge and random forest, choose the final model
 #   python pipeline.py robustness  step 6, part A: the step 5 candidates on a sliding window
-#   python pipeline.py test        step 6, part B: THE FINAL TEST. Opens the test seasons.
+#   python pipeline.py test        step 6: THE FINAL TEST. Opens the test seasons. Walk
+#                                  forward: each test season is predicted by the final
+#                                  model refitted on every season before it.
 #
 # About "features":
 # It reads data/sprints_raw.csv and data/races_all.csv, cleans them, builds
@@ -166,7 +168,9 @@ WINDOW_SEASONS = 5
 
 # Step 6: the final test. The final model chosen in step 5 (18 Nov),
 # written here by hand after "python pipeline.py models". Frozen: nothing
-# here may change after the test numbers have been seen.
+# here may change after the test numbers have been seen. In the walk forward
+# test the same frozen model is fitted again for each test season, on every
+# season before it: the rows change, the model and its settings do not.
 FINAL_FAMILY = "lasso"           # chosen by the one standard error rule
 FINAL_INPUTS = "NO_LOAD"         # 10 inputs, without the 3 load features
 FINAL_VALUE = 0.01               # alpha of the lasso
@@ -1363,9 +1367,14 @@ def run_robustness():
 
 
 # ------------------------------------------------------------------ final test
-# Step 6: the final test. The functions below get the training rows and the
-# test rows as 2 tables. Only run_test() and load_test_data() load the real
-# test rows.
+# Step 6: the final test, walk forward like the validation folds of make_folds.
+# Each test season is predicted by models fitted on every season before it:
+#   2023/24: fit on 2013/14 to 2022/23
+#   2024/25: fit on 2013/14 to 2023/24
+#   2025/26: fit on 2013/14 to 2024/25
+# The history season 2012/13 is never trained on. The functions below get the
+# training rows and the test rows as 2 tables. Only run_test() and
+# load_test_data() load the real test rows.
 
 def load_test_rows():
     """Load the rows of the TEST seasons from data/features.csv.
@@ -1511,16 +1520,30 @@ def test_slice_table(rows):
     return pd.DataFrame(lines)
 
 
-def test_permutation_table(model, rows):
+def predict_by_season(models, rows, X):
+    """Predict every row with the model of its own test season.
+    models: 1 fitted model per test season. X: the inputs of the rows."""
+    pred = np.zeros(len(rows))
+    for season, model in models.items():
+        keep = (rows["season"] == season).to_numpy()     # the rows of this season
+        pred[keep] = model.predict(X[keep])
+    return pred
+
+
+def test_permutation_table(models, rows):
     """Permutation importance of the final model on the test rows: shuffle
-    1 input (or 1 group of inputs) between the rows, so that it no longer
-    belongs to the right athlete, and see how much the list MAE goes up.
-    A big increase means the model needs this input. 20 repeats, sample
-    standard deviation (ddof = 1)."""
+    1 input (or 1 group of inputs) between the rows of all 3 test seasons,
+    so that it no longer belongs to the right athlete, and see how much the
+    list MAE goes up. Every row is predicted by the model of its own season,
+    before and after the shuffle. A big increase means the model needs this
+    input. 20 repeats, sample standard deviation (ddof = 1)."""
     columns = INPUT_SETS[FINAL_INPUTS]
     X = rows[columns]
-    weights = pd.Series(model.named_steps["lasso"].coef_, index=columns)
-    base = list_mae(rows, model.predict(X))               # nothing shuffled
+    # An input counts as dropped only if the lasso set its weight to 0 in all 3 fits.
+    weights = pd.DataFrame({season: model.named_steps["lasso"].coef_
+                            for season, model in models.items()}, index=columns)
+    zero_in_all = (weights == 0).all(axis=1)
+    base = list_mae(rows, predict_by_season(models, rows, X))      # nothing shuffled
 
     # a) each input alone, b) each group: the columns of a group get the SAME
     # new row order, so the values of the group stay together.
@@ -1534,11 +1557,11 @@ def test_permutation_table(model, rows):
             order = rng.permutation(len(X))                # a random order of the rows
             shuffled = X.copy()
             shuffled[members] = X[members].to_numpy()[order]
-            increases.append(list_mae(rows, model.predict(shuffled)) - base)
+            increases.append(list_mae(rows, predict_by_season(models, rows, shuffled)) - base)
         increases = np.array(increases)
         lines.append({"version": version, "name": name, "inputs": ", ".join(members),
-                      # True if the lasso set the weight of every input here to 0.
-                      "lasso_weight_zero": bool((weights[members] == 0).all()),
+                      # True if every input here has a weight of 0 in all 3 fits.
+                      "lasso_weight_zero": bool(zero_in_all[members].all()),
                       "list_mae_increase_mean": increases.mean(),
                       "list_mae_increase_std": increases.std(ddof=1)})
 
@@ -1548,8 +1571,19 @@ def test_permutation_table(model, rows):
     return table.sort_values(["version", "list_mae_increase_mean"], ascending=[True, False]).reset_index(drop=True)
 
 
-def final_weights_table(model):
-    """The weights of the fitted final lasso, on the scaled inputs, sorted by
+def final_weights_table(models):
+    """The weights of the 3 fitted final lassos (1 per test season), 1 block
+    per season, each block sorted by size (the zeros last)."""
+    blocks = []
+    for season, model in models.items():
+        table = season_weights_table(model)
+        table.insert(0, "test_season", season)          # the season this fit predicts
+        blocks.append(table)
+    return pd.concat(blocks, ignore_index=True)
+
+
+def season_weights_table(model):
+    """The weights of 1 fitted final lasso, on the scaled inputs, sorted by
     size (the zeros last), with the numbers that the fill step and the scale
     step learned."""
     lasso = model.named_steps["lasso"]
@@ -1602,31 +1636,48 @@ def story_title(race_line):
 
 
 def test_tables(train, test):
-    """Everything of step 6 for the given training rows and test rows:
-    fit the 3 models on the training rows, predict the test rows, and build
-    every table. Every warning is caught and counted. Nothing is saved here."""
+    """Everything of step 6 for the given training rows and test rows, walk
+    forward: for each test season, fit the final model, the constant and the
+    naive rule on the training rows plus the test seasons before it, and
+    predict the rows of that season only. Then the 3 seasons are put together
+    and every table is built. Every warning is caught and counted. Nothing is
+    saved here."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        model = fit_final_model(train)
-        baselines = fit_baselines(train)
-        rows = add_predictions(model, baselines, test)
+        models = {}                                   # 1 fitted final model per test season
+        baselines = {}                                # 1 constant value and naive fill per test season
+        fit_rows = {}                                 # how many rows each fit used
+        parts = []
+        for number, season in enumerate(TEST_SEASONS):
+            earlier = test[test["season"].isin(TEST_SEASONS[:number])]   # the test seasons before it
+            rows_before = pd.concat([train, earlier])
+            models[season] = fit_final_model(rows_before)
+            baselines[season] = fit_baselines(rows_before)
+            fit_rows[season] = len(rows_before)
+            parts.append(add_predictions(models[season], baselines[season],
+                                         test[test["season"] == season]))
+        rows = pd.concat(parts, ignore_index=True)    # the 3 seasons together
         scores = test_score_table(rows)
-        tables = {"model": model,
+        tables = {"models": models,
                   "baselines": baselines,
+                  "fit_rows": fit_rows,
                   "predictions": rows,
                   "scores": scores,
                   "versus_validation": test_validation_table(scores),
                   "races": test_race_table(rows),
                   "slices": test_slice_table(rows),
-                  "permutation": test_permutation_table(model, rows),
-                  "weights": final_weights_table(model)}
+                  "permutation": test_permutation_table(models, rows),
+                  "weights": final_weights_table(models)}
     tables["warnings"] = [w.category.__name__ + ": " + str(w.message) for w in caught]
     return tables
 
 
 def load_test_data():
-    """Load the training rows and the test rows of the final test, and check
-    them. If a check fails the command stops here, before any score exists."""
+    """Load the training rows (2013/14 to 2022/23) and the test rows of the
+    final test, and check them. In the walk forward test the rows of a test
+    season are also used to fit the models of the later test seasons, so the
+    time check is done for each test season. If a check fails the command
+    stops here, before any score exists."""
     df = load_features()                                   # open seasons only
     train = df[df["season"].isin(TRAIN_SEASONS)]
     test = load_test_rows()                                # THE TEST SEASONS
@@ -1641,8 +1692,12 @@ def load_test_data():
         problems.append("test rows: " + str(len(test)))
     if test["race_id"].nunique() != EXPECTED_TEST_RACES:
         problems.append("test races: " + str(test["race_id"].nunique()))
-    if not train["start"].max() < test["start"].min():
-        problems.append("a training race starts after a test race")
+    # Each test season: every row its models are fitted on (the training rows
+    # and the test seasons before it) must start before its first race.
+    for number, season in enumerate(TEST_SEASONS):
+        rows_before = pd.concat([train, test[test["season"].isin(TEST_SEASONS[:number])]])
+        if not rows_before["start"].max() < test[test["season"] == season]["start"].min():
+            problems.append("a race used to fit the models of " + season + " starts after its first race")
     if sorted(test["season"].unique()) != TEST_SEASONS:
         problems.append("test seasons: " + str(sorted(test["season"].unique())))
     # The groups of the permutation importance must hold each input exactly once.
@@ -1655,8 +1710,10 @@ def load_test_data():
 
 
 def run_test():
-    """Step 6: the final test. Run once; a rerun of the same code may only
-    reproduce the same numbers."""
+    """Step 6: the final test, walk forward: each test season is predicted by
+    the frozen final model (and the constant and the naive rule) refitted on
+    every season before it. A rerun of the same code may only reproduce the
+    same numbers."""
     train, test = load_test_data()
     print("training rows:", len(train), "  seasons", train["season"].min(), "to", train["season"].max(),
           "  latest start:", train["start"].max()[:10])
@@ -1689,9 +1746,13 @@ def run_test():
 
     weights = tables["weights"]
     print("final model  :", candidate_name(FINAL_FAMILY, FINAL_INPUTS, FINAL_VALUE), ",",
-          len(INPUT_SETS[FINAL_INPUTS]), "inputs, nonzero weights:", int((~weights["dropped"]).sum()))
-    print("constant value:", round(tables["baselines"]["constant_value"], 5),
-          "  naive fill:", round(tables["baselines"]["naive_fill"], 5))
+          len(INPUT_SETS[FINAL_INPUTS]), "inputs, refitted for each test season")
+    for season in TEST_SEASONS:
+        one = weights[weights["test_season"] == season]
+        print("  " + season + ": fitted on", tables["fit_rows"][season], "rows",
+              "  nonzero weights:", int((~one["dropped"]).sum()),
+              "  constant value:", round(tables["baselines"][season]["constant_value"], 5),
+              "  naive fill:", round(tables["baselines"][season]["naive_fill"], 5))
     print("warnings     :", len(tables["warnings"]))
     for text in tables["warnings"]:
         print("   ", text)
@@ -1713,9 +1774,12 @@ def run_test():
     print("inputs with a lasso weight of 0 show exactly 0:",
           bool((zero["list_mae_increase_mean"] == 0).all() and (zero["list_mae_increase_std"] == 0).all()),
           " (" + str(len(zero)) + " lines)")
-    print("\n--- weights of the refitted final lasso, on the scaled inputs ---")
-    print(weights[["feature", "weight", "dropped"]].round(5).to_string(index=False))
-    print("intercept:", round(weights["intercept"].iloc[0], 5), "  rounds used:", int(weights["rounds_used"].iloc[0]))
+    print("\n--- weights of the 3 fitted final lassos, on the scaled inputs ---")
+    for season in TEST_SEASONS:
+        one = weights[weights["test_season"] == season]
+        print("test season", season, "  intercept:", round(one["intercept"].iloc[0], 5),
+              "  rounds used:", int(one["rounds_used"].iloc[0]))
+        print(one[["feature", "weight", "dropped"]].round(5).to_string(index=False))
     print("\nstory race:", story["race_id"], story["place"], story["day"],
           " list MAE:", round(story["list_mae_final"], 5))
     print("\nsaved in " + OUTPUT_DIR + "/:", ", ".join(name + ".csv" for name in saved),

@@ -1,15 +1,15 @@
 version,name,inputs,lasso_weight_zero,list_mae_increase_mean,list_mae_increase_std,list_mae_not_shuffled,repeats
-a) each input alone,last3_ski_pct,last3_ski_pct,False,0.10094079073452344,0.0025943439338685934,0.14962927825491165,20
-a) each input alone,last_place_any,last_place_any,False,0.014081433622366213,0.0011924002515261638,0.14962927825491165,20
-a) each input alone,no_history,no_history,False,0.0065377252163290765,0.000457226510998386,0.14962927825491165,20
-a) each input alone,last3_finish_pct,last3_finish_pct,False,0.0034498403588977557,0.000656182784598727,0.14962927825491165,20
-a) each input alone,last3_range_pct,last3_range_pct,False,0.0030466757342888437,0.00046542768635630667,0.14962927825491165,20
-a) each input alone,window_mean_misses,window_mean_misses,False,0.001171704971225572,0.00024558014514575015,0.14962927825491165,20
-a) each input alone,last3_miss_pct,last3_miss_pct,True,0.0,0.0,0.14962927825491165,20
-a) each input alone,last_finish_pct,last_finish_pct,True,0.0,0.0,0.14962927825491165,20
-a) each input alone,n_sprints_window,n_sprints_window,True,0.0,0.0,0.14962927825491165,20
-a) each input alone,window_miss_dispersion,window_miss_dispersion,True,0.0,0.0,0.14962927825491165,20
-b) by group,skiing,last3_ski_pct,False,0.10094079073452344,0.0025943439338685934,0.14962927825491165,20
-b) by group,results,"last3_finish_pct, last_finish_pct, last_place_any",False,0.032831697439384,0.001698619150016621,0.14962927825491165,20
-b) by group,experience,"n_sprints_window, no_history",False,0.0065377252163290765,0.000457226510998386,0.14962927825491165,20
-b) by group,shooting,"last3_range_pct, last3_miss_pct, window_mean_misses, window_miss_dispersion",False,0.005312828368675827,0.000571370984717055,0.14962927825491165,20
+a) each input alone,last3_ski_pct,last3_ski_pct,False,0.09768639138043742,0.002551960450589366,0.14956679857119706,20
+a) each input alone,last_place_any,last_place_any,False,0.014593305969577702,0.0012232766635236793,0.14956679857119706,20
+a) each input alone,no_history,no_history,False,0.006463066698863542,0.0004581931865888112,0.14956679857119706,20
+a) each input alone,last3_finish_pct,last3_finish_pct,False,0.004215803039246664,0.0007100624844198487,0.14956679857119706,20
+a) each input alone,last3_range_pct,last3_range_pct,False,0.0030398256320054162,0.00043851084158104875,0.14956679857119706,20
+a) each input alone,window_mean_misses,window_mean_misses,False,0.001100072722351654,0.0002369946091207985,0.14956679857119706,20
+a) each input alone,last3_miss_pct,last3_miss_pct,True,0.0,0.0,0.14956679857119706,20
+a) each input alone,last_finish_pct,last_finish_pct,True,0.0,0.0,0.14956679857119706,20
+a) each input alone,n_sprints_window,n_sprints_window,True,0.0,0.0,0.14956679857119706,20
+a) each input alone,window_miss_dispersion,window_miss_dispersion,True,0.0,0.0,0.14956679857119706,20
+b) by group,skiing,last3_ski_pct,False,0.09768639138043742,0.002551960450589366,0.14956679857119706,20
+b) by group,results,"last3_finish_pct, last_finish_pct, last_place_any",False,0.03573544702807392,0.0017856256227653463,0.14956679857119706,20
+b) by group,experience,"n_sprints_window, no_history",False,0.006463066698863542,0.0004581931865888112,0.14956679857119706,20
+b) by group,shooting,"last3_range_pct, last3_miss_pct, window_mean_misses, window_miss_dispersion",False,0.005052415137568059,0.0005503830748959321,0.14956679857119706,20
